@@ -1,0 +1,14 @@
+{
+  "diplan_torch_mem": {
+    "success_rate": 0.0,
+    "first_error_step": 1.3,
+    "recovery_at_error": 0.0,
+    "trap_at_1": 0.0,
+    "plan_feasibility": 1.0,
+    "constraint_violation_rate": 0.0,
+    "plan_execution_consistency": 0.3783333333333333,
+    "token_cost": 86.5,
+    "latency_cost": 0.52,
+    "diversity_coverage": 1.0
+  }
+}

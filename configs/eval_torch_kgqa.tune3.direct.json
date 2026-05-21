@@ -1,0 +1,10 @@
+{
+  "test_path": "data/real_processed/kgqa_test.jsonl",
+  "train_path": "data/real_processed/kgqa_train.jsonl",
+  "seed": 42,
+  "num_candidates": 1,
+  "receding_horizon": false,
+  "use_value_model": false,
+  "use_cuda": false,
+  "use_memory_retrieval": false
+}

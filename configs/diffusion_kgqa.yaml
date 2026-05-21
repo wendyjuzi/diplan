@@ -1,0 +1,6 @@
+{
+  "train_path": "data/processed/kgqa_train.jsonl",
+  "sampling_steps": 20,
+  "guidance_scale": 1.2
+}
+

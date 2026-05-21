@@ -1,0 +1,62 @@
+{
+  "full_diplan": {
+    "success_rate": 0.26851851851851855,
+    "first_error_step": 2.7037037037037037,
+    "recovery_at_error": 0.6018518518518519,
+    "trap_at_1": 0.09259259259259259,
+    "plan_feasibility": 1.0,
+    "constraint_violation_rate": 1.0,
+    "plan_execution_consistency": 1.0,
+    "token_cost": 284.4074074074074,
+    "latency_cost": 1.3155555555555556,
+    "diversity_coverage": 0.8598765432098765
+  },
+  "no_value_guidance": {
+    "success_rate": 0.3055555555555556,
+    "first_error_step": 2.675925925925926,
+    "recovery_at_error": 0.6018518518518519,
+    "trap_at_1": 0.10185185185185185,
+    "plan_feasibility": 1.0,
+    "constraint_violation_rate": 1.0,
+    "plan_execution_consistency": 1.0,
+    "token_cost": 284.4074074074074,
+    "latency_cost": 1.3155555555555556,
+    "diversity_coverage": 0.884104938271605
+  },
+  "no_constraint_checker": {
+    "success_rate": 0.2962962962962963,
+    "first_error_step": 2.8703703703703702,
+    "recovery_at_error": 0.5555555555555556,
+    "trap_at_1": 0.08333333333333333,
+    "plan_feasibility": 0.9074074074074074,
+    "constraint_violation_rate": 0.09259259259259259,
+    "plan_execution_consistency": 1.0,
+    "token_cost": 284.4074074074074,
+    "latency_cost": 1.3155555555555556,
+    "diversity_coverage": 0.8598765432098765
+  },
+  "no_receding_horizon": {
+    "success_rate": 0.037037037037037035,
+    "first_error_step": 2.0185185185185186,
+    "recovery_at_error": 0.5277777777777778,
+    "trap_at_1": 0.09259259259259259,
+    "plan_feasibility": 1.0,
+    "constraint_violation_rate": 0.9074074074074074,
+    "plan_execution_consistency": 1.0,
+    "token_cost": 65.16666666666667,
+    "latency_cost": 0.32,
+    "diversity_coverage": 0.9971064814814815
+  },
+  "low_candidate_budget": {
+    "success_rate": 0.09259259259259259,
+    "first_error_step": 2.0925925925925926,
+    "recovery_at_error": 0.6944444444444444,
+    "trap_at_1": 0.05555555555555555,
+    "plan_feasibility": 1.0,
+    "constraint_violation_rate": 0.8611111111111112,
+    "plan_execution_consistency": 1.0,
+    "token_cost": 74.18518518518519,
+    "latency_cost": 0.3288888888888889,
+    "diversity_coverage": 0.9535493827160494
+  }
+}

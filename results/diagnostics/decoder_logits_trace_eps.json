@@ -1,0 +1,383 @@
+{
+  "task_id": "cwq_0013999",
+  "dataset": "cwq",
+  "query": "Which school was attended by the actor who played the character named Super Ghoul?",
+  "query_tokens": [
+    "which",
+    "school",
+    "was",
+    "attended",
+    "by",
+    "the",
+    "actor",
+    "who",
+    "played",
+    "the",
+    "character",
+    "named",
+    "super",
+    "ghoul"
+  ],
+  "oracle_path": [
+    "film.actor.film",
+    "film.performance.character",
+    "people.person.education",
+    "education.education.institution"
+  ],
+  "planner_prediction_target": "eps",
+  "latent_norm_enabled": true,
+  "z_norm_stats": {
+    "mean": 0.03753304481506348,
+    "std": 0.993152916431427,
+    "min": -2.292835235595703,
+    "max": 2.690187692642212
+  },
+  "z_denorm_stats": {
+    "mean": -0.14324770867824554,
+    "std": 2.9729692935943604,
+    "min": -6.343337535858154,
+    "max": 7.312867164611816
+  },
+  "z_oracle_stats": {
+    "mean": -0.3307577669620514,
+    "std": 3.685303211212158,
+    "min": -6.985511779785156,
+    "max": 6.65876579284668
+  },
+  "trace_pre_denorm": {
+    "decoded_ids": [],
+    "decoded_tokens": [],
+    "decode_greedy_tokens": [],
+    "pred_len": 3,
+    "steps": [
+      {
+        "step": 0,
+        "greedy_id": 2,
+        "greedy_token": "<eos>",
+        "topk": [
+          {
+            "id": 2,
+            "token": "<eos>",
+            "logit": 1.7604378461837769
+          },
+          {
+            "id": 22,
+            "token": "sports.pro_athlete.teams",
+            "logit": 1.7191332578659058
+          },
+          {
+            "id": 17,
+            "token": "government.government_position_held.from",
+            "logit": 1.365381121635437
+          },
+          {
+            "id": 23,
+            "token": "sports.sports_team_roster.team",
+            "logit": 1.352616548538208
+          },
+          {
+            "id": 36,
+            "token": "measurement_unit.dated_integer.number",
+            "logit": 1.1921299695968628
+          }
+        ]
+      }
+    ]
+  },
+  "trace_post_denorm": {
+    "decoded_ids": [
+      33,
+      71
+    ],
+    "decoded_tokens": [
+      "location.location.contains",
+      "base.biblioness.bibs_location.loc_type"
+    ],
+    "decode_greedy_tokens": [
+      "location.location.contains",
+      "base.biblioness.bibs_location.loc_type"
+    ],
+    "pred_len": 3,
+    "steps": [
+      {
+        "step": 0,
+        "greedy_id": 33,
+        "greedy_token": "location.location.contains",
+        "topk": [
+          {
+            "id": 33,
+            "token": "location.location.contains",
+            "logit": 7.439615726470947
+          },
+          {
+            "id": 22,
+            "token": "sports.pro_athlete.teams",
+            "logit": 7.3356804847717285
+          },
+          {
+            "id": 16,
+            "token": "location.location.containedby",
+            "logit": 7.143461227416992
+          },
+          {
+            "id": 75,
+            "token": "music.lyricist.lyrics_written",
+            "logit": 7.029041290283203
+          },
+          {
+            "id": 7,
+            "token": "government.governmental_jurisdiction.governing_officials",
+            "logit": 6.991694927215576
+          }
+        ]
+      },
+      {
+        "step": 1,
+        "greedy_id": 71,
+        "greedy_token": "base.biblioness.bibs_location.loc_type",
+        "topk": [
+          {
+            "id": 71,
+            "token": "base.biblioness.bibs_location.loc_type",
+            "logit": 7.591252326965332
+          },
+          {
+            "id": 6,
+            "token": "common.topic.notable_types",
+            "logit": 6.795090675354004
+          },
+          {
+            "id": 414,
+            "token": "aviation.airport.serves",
+            "logit": 5.456089496612549
+          },
+          {
+            "id": 37,
+            "token": "government.politician.government_positions_held",
+            "logit": 4.538559436798096
+          },
+          {
+            "id": 16,
+            "token": "location.location.containedby",
+            "logit": 4.474341869354248
+          }
+        ]
+      },
+      {
+        "step": 2,
+        "greedy_id": 2,
+        "greedy_token": "<eos>",
+        "topk": [
+          {
+            "id": 2,
+            "token": "<eos>",
+            "logit": 11.212855339050293
+          },
+          {
+            "id": 80,
+            "token": "topic_server.population_number",
+            "logit": 5.3419365882873535
+          },
+          {
+            "id": 36,
+            "token": "measurement_unit.dated_integer.number",
+            "logit": 5.161592483520508
+          },
+          {
+            "id": 161,
+            "token": "location.location.gnis_feature_id",
+            "logit": 4.432149410247803
+          },
+          {
+            "id": 91,
+            "token": "location.country.calling_code",
+            "logit": 4.102677822113037
+          }
+        ]
+      }
+    ]
+  },
+  "trace_oracle_z": {
+    "decoded_ids": [
+      4,
+      12,
+      8,
+      9
+    ],
+    "decoded_tokens": [
+      "film.actor.film",
+      "film.performance.character",
+      "people.person.education",
+      "education.education.institution"
+    ],
+    "decode_greedy_tokens": [
+      "film.actor.film",
+      "film.performance.character",
+      "people.person.education",
+      "education.education.institution"
+    ],
+    "pred_len": 4,
+    "steps": [
+      {
+        "step": 0,
+        "greedy_id": 4,
+        "greedy_token": "film.actor.film",
+        "topk": [
+          {
+            "id": 4,
+            "token": "film.actor.film",
+            "logit": 15.395137786865234
+          },
+          {
+            "id": 8,
+            "token": "people.person.education",
+            "logit": 15.25661563873291
+          },
+          {
+            "id": 69,
+            "token": "film.film_character.portrayed_in_films",
+            "logit": 12.968216896057129
+          },
+          {
+            "id": 38,
+            "token": "award.award_nominee.award_nominations",
+            "logit": 12.854557037353516
+          },
+          {
+            "id": 34,
+            "token": "film.film.starring",
+            "logit": 12.616063117980957
+          }
+        ]
+      },
+      {
+        "step": 1,
+        "greedy_id": 12,
+        "greedy_token": "film.performance.character",
+        "topk": [
+          {
+            "id": 12,
+            "token": "film.performance.character",
+            "logit": 15.818415641784668
+          },
+          {
+            "id": 5,
+            "token": "film.performance.film",
+            "logit": 15.431243896484375
+          },
+          {
+            "id": 8,
+            "token": "people.person.education",
+            "logit": 11.994933128356934
+          },
+          {
+            "id": 4,
+            "token": "film.actor.film",
+            "logit": 10.52699089050293
+          },
+          {
+            "id": 7,
+            "token": "government.governmental_jurisdiction.governing_officials",
+            "logit": 10.416743278503418
+          }
+        ]
+      },
+      {
+        "step": 2,
+        "greedy_id": 8,
+        "greedy_token": "people.person.education",
+        "topk": [
+          {
+            "id": 8,
+            "token": "people.person.education",
+            "logit": 10.230040550231934
+          },
+          {
+            "id": 34,
+            "token": "film.film.starring",
+            "logit": 9.86705207824707
+          },
+          {
+            "id": 4,
+            "token": "film.actor.film",
+            "logit": 8.680988311767578
+          },
+          {
+            "id": 42,
+            "token": "people.person.spouse_s",
+            "logit": 8.40329647064209
+          },
+          {
+            "id": 12,
+            "token": "film.performance.character",
+            "logit": 8.250905990600586
+          }
+        ]
+      },
+      {
+        "step": 3,
+        "greedy_id": 9,
+        "greedy_token": "education.education.institution",
+        "topk": [
+          {
+            "id": 9,
+            "token": "education.education.institution",
+            "logit": 12.33206558227539
+          },
+          {
+            "id": 261,
+            "token": "education.education.major_field_of_study",
+            "logit": 8.011564254760742
+          },
+          {
+            "id": 12,
+            "token": "film.performance.character",
+            "logit": 7.932949066162109
+          },
+          {
+            "id": 169,
+            "token": "education.education.degree",
+            "logit": 7.77599573135376
+          },
+          {
+            "id": 124,
+            "token": "film.film_crew_gig.crewmember",
+            "logit": 7.685240745544434
+          }
+        ]
+      },
+      {
+        "step": 4,
+        "greedy_id": 2,
+        "greedy_token": "<eos>",
+        "topk": [
+          {
+            "id": 2,
+            "token": "<eos>",
+            "logit": 12.254471778869629
+          },
+          {
+            "id": 169,
+            "token": "education.education.degree",
+            "logit": 6.841866493225098
+          },
+          {
+            "id": 36,
+            "token": "measurement_unit.dated_integer.number",
+            "logit": 6.794255256652832
+          },
+          {
+            "id": 6,
+            "token": "common.topic.notable_types",
+            "logit": 6.742232322692871
+          },
+          {
+            "id": 178,
+            "token": "people.marriage.from",
+            "logit": 6.218740463256836
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -1,0 +1,34 @@
+{
+  "allowed_relations": [
+    "acted_in",
+    "award_received",
+    "born_in",
+    "country_of_origin",
+    "developer",
+    "directed",
+    "distribution_platform",
+    "educated_at",
+    "founded_by",
+    "genre",
+    "has_capital",
+    "has_industry",
+    "headquarters",
+    "instance_of",
+    "language_spoken",
+    "located_in",
+    "member_of",
+    "nationality",
+    "neighbor_of",
+    "operating_system",
+    "part_of",
+    "published_in",
+    "subclass_of",
+    "uses_language"
+  ],
+  "global_max_steps": 6,
+  "frequent_banned_relations": [
+    "part_of",
+    "subclass_of",
+    "country_of_origin"
+  ]
+}

@@ -1,0 +1,15 @@
+{
+  "train_path": "data/real_processed/kgqa_train.jsonl",
+  "seed": 42,
+  "min_freq": 1,
+  "max_path_len": 8,
+  "batch_size": 64,
+  "emb_dim": 128,
+  "hid_dim": 192,
+  "latent_dim": 128,
+  "lr": 0.0003,
+  "epochs": 8,
+  "length_loss_weight": 0.25,
+  "use_cuda": false
+}
+

@@ -1,0 +1,2 @@
+method,success_rate,first_error_step,recovery_at_error,trap_at_1,plan_feasibility,constraint_violation_rate,plan_execution_consistency,token_cost,latency_cost,diversity_coverage
+diplan_torch_mem,0.0,1.3,0.0,0.0,1.0,0.0,0.3783333333333333,88.2,0.53,1.0

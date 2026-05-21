@@ -1,0 +1,32 @@
+{
+  "base_eval_config": "configs/eval_torch_kgqa.yaml",
+  "experiments": [
+    {
+      "name": "full_diplan_torch",
+      "overrides": {
+        "num_candidates": 12,
+        "receding_horizon": true,
+        "use_value_model": true
+      }
+    },
+    {
+      "name": "no_value_guidance_torch",
+      "overrides": {
+        "use_value_model": false
+      }
+    },
+    {
+      "name": "no_receding_horizon_torch",
+      "overrides": {
+        "receding_horizon": false
+      }
+    },
+    {
+      "name": "low_candidate_budget_torch",
+      "overrides": {
+        "num_candidates": 4
+      }
+    }
+  ]
+}
+

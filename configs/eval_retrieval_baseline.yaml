@@ -1,0 +1,8 @@
+{
+  "train_path": "data/real_processed/kgqa_train.jsonl",
+  "test_path": "data/real_processed/kgqa_test.jsonl",
+  "seed": 42,
+  "top_k": 8,
+  "max_postings_per_token": 1200
+}
+

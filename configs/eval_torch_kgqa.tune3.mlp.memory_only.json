@@ -1,0 +1,13 @@
+{
+  "test_path": "data/real_processed/kgqa_test.jsonl",
+  "train_path": "data/real_processed/kgqa_train.jsonl",
+  "seed": 42,
+  "num_candidates": 12,
+  "receding_horizon": false,
+  "use_value_model": false,
+  "use_cuda": false,
+  "use_memory_retrieval": true,
+  "memory_prefilter_feasible": true,
+  "memory_top_k": 12,
+  "memory_max_postings_per_token": 1800
+}

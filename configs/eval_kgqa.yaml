@@ -1,0 +1,17 @@
+{
+  "test_path": "data/processed/kgqa_test.jsonl",
+  "seed": 42,
+  "methods": [
+    "single_step",
+    "beam_search",
+    "lookahead",
+    "diplan"
+  ],
+  "diplan_options": {
+    "num_candidates": 16,
+    "use_value_guidance": true,
+    "use_constraint_checker": true,
+    "receding_horizon": true
+  }
+}
+

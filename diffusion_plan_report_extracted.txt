@@ -1,0 +1,579 @@
+
+
+===== PAGE 1 =====
+基于 Diffusion 的 Plan-Centric 长程
+Agent 推理框架
+一份面向长程任务、工具调用与动作执行的学术研究方案
+报告定位
+本报告围绕“Agent 在长程任务中先规划再执行 action 或 tool call”的主题，提出
+一个不依赖 MCTS 的原创性框架：DiPLaN，即 Diffusion Planner for Long-
+Horizon Agentic Reasoning。核心思想是将长程任务中的“计划”视为可学习
+的轨迹分布，通过条件扩散模型生成多模态候选计划，再由价值评估、约束检查和
+receding-horizon 执行机制实现可恢复、可审计、可迁移的长程决策。
+版本：研究蓝图草案 2026
+
+===== PAGE 2 =====
+Diffusion-Based Plan-Centric Long-Horizon Reasoning 研究方案报告
+目录
+1 研究背景与核心问题 3
+1.1 长程 Agent 的根本困难：reasoning 不等于 planning . . . . . . . . . . . . . . . . . 3
+1.2 为什么不直接沿用 MCTS . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 3
+2 研究目标与总体思路 4
+2.1 研究目标 . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 4
+2.2 框架命名：DiPLaN . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 4
+3 形式化问题定义 4
+4 计划表示：从动作序列到结构化计划轨迹 5
+4.1 为什么不能只生成 action sequence . . . . . . . . . . . . . . . . . . . . . . . . . . . 5
+4.2 连续潜变量计划空间 . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 6
+5 DiPLaN 方法设计 6
+5.1 模块一：Planning State Encoder . . . . . . . . . . . . . . . . . . . . . . . . . . . . 6
+5.2 模块二：Diffusion Plan Generator . . . . . . . . . . . . . . . . . . . . . . . . . . . 6
+5.3 模块三：Value-Guided Plan Refinement . . . . . . . . . . . . . . . . . . . . . . . . 7
+5.4 模块四：Feasibility Projection and Tool Decoder . . . . . . . . . . . . . . . . . . . 7
+5.5 模块五：Receding-Horizon Execution. . . . . . . . . . . . . . . . . . . . . . . . . . 7
+6 推理算法 8
+7 训练方案 8
+7.1 数据来源 . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 8
+7.2 计划抽取与标准化 . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 9
+7.3 三阶段训练 . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 9
+7.3.1 阶段一：计划自编码器训练 . . . . . . . . . . . . . . . . . . . . . . . . . . . 9
+7.3.2 阶段二：决策加权扩散训练 . . . . . . . . . . . . . . . . . . . . . . . . . . . 9
+7.3.3 阶段三：价值模型与约束模型训练 . . . . . . . . . . . . . . . . . . . . . . . 9
+8 理论分析框架 9
+8.1 计划覆盖假设 . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 10
+8.2 评价器排序误差 . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 10
+8.3 有限承诺降低错误放大 . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 10
+9 实验设计 10
+9.1 Benchmark 选择 . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 10
+9.2 Baselines . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 11
+9.3 指标体系 . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 11
+9.4 核心消融实验 . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 12
+1
+
+===== PAGE 3 =====
+Diffusion-Based Plan-Centric Long-Horizon Reasoning 研究方案报告
+10 可执行实施路线 12
+10.1 MVP 版本 . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 12
+10.2 系统实现模块 . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 12
+10.3 12 周研究计划 . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 13
+11 预期结果与论文故事线 13
+12 原创性分析 14
+13 风险与解决方案 14
+14 建议论文结构 15
+15 结论 15
+2
+
+===== PAGE 4 =====
+Diffusion-Based Plan-Centric Long-Horizon Reasoning 研究方案报告
+摘要
+现有 LLM Agent 在短程任务中常表现出较强的逐步推理能力，但在长程任务中容易出现
+早期短视承诺、错误累积、约束遗忘和行动轨迹崩塌。近期工作从规划中心视角指出，step-wise
+reasoning 本质上接近局部贪心决策；即便扩大 beam width，也不能从根本上避免早期局部最
+优动作导致的全局失败。受此启发，本报告提出一个全新的 Diffusion-based Plan-Centric
+框架，用于长程工具调用、网页操作、知识图谱推理和 embodied/text-game 任务。与基于显
+式树搜索的 MCTS-lookahead 不同，本文设计的 DiPLaN 将计划表示为条件轨迹分布，利用
+扩散模型在计划空间中生成多样化、全局一致的候选计划，并通过价值引导、可行性投影、约
+束验证和 receding-horizon 执行机制实现面向未来的行动选择。本报告给出完整问题定义、模
+型结构、训练流程、推理算法、理论分析框架、实验设计、实施路线和风险控制，目标是形成
+一个可执行、可投稿、原创性较强的研究方案。
+1 研究背景与核心问题
+1.1 长程 Agent 的根本困难：reasoning 不等于 planning
+长程任务与普通问答或短程推理不同。Agent 不仅要生成看似合理的下一步，还要维持跨多
+个阶段的目标一致性、约束一致性、状态记忆、工具依赖和错误恢复能力。在工具调用、网页操
+作、知识图谱多跳推理、ALFWorld/ScienceWorld 等环境中，早期一个局部看似合理的动作可能
+把 Agent 带入不可恢复的错误区域。
+近期论文 Why Reasoning Fails to Plan: A Planning-Centric Analysis of Long-Horizon Deci-
+sionMakinginLLMAgents明确提出：LLM的step-by-stepreasoning可以被抽象为一种step-wise
+greedy policy，即每一步根据局部评分选择动作，而不是根据未来累计价值选择动作。该文证明
+step-wise greedy policy 在长程任务中可能任意次优，并指出 beam search 只是扩大局部搜索宽
+度，仍不能避免最优前缀被早期剪枝的问题。论文还提出 FLARE 作为显式 lookahead、backward
+value propagation 和 limited commitment 的最小实现，用于证明规划机制的重要性。
+这一诊断对我们提出新框架非常关键：如果长程失败来自“局部推理范式”本身，那么单纯增
+加 CoT、self-reflection、beam width 或模型规模并不足够。真正需要的是一种计划中心机制：它
+必须能在行动前显式构造多个可能未来，并让远期结果影响早期动作。
+1.2 为什么不直接沿用 MCTS
+MCTS 是一种自然的显式前瞻机制，但如果研究目标是提出具有较强原创性的 Agent 规划框
+架，直接沿用 MCTS 有三个限制。
+第一，MCTS是在线树搜索，计算成本随分支数和深度快速增长。在真实tool-use或webtask
+中，状态与动作空间通常巨大且语义复杂，树搜索很容易被无效分支消耗预算。
+第二，MCTS 的探索通常依赖离散树结构。很多 LLM Agent 的计划不是标准离散动作树，而
+是由自然语言子目标、工具调用、参数选择、约束满足和执行检查共同组成的混合对象。将其强
+行离散成树，容易丢失计划之间的语义邻近性。
+第三，MCTS主要是在线搜索机制。它能在单个实例上搜索较好轨迹，但不天然提供跨任务的
+计划分布学习能力。相比之下，扩散模型可以学习“成功计划长什么样”，并在新任务中以amortized
+planning 的方式快速生成候选计划。
+3
+
+===== PAGE 5 =====
+Diffusion-Based Plan-Centric Long-Horizon Reasoning 研究方案报告
+因此，本报告提出的目标不是“把 MCTS 换成 diffusion”，而是从头设计一种生成式计划分
+布学习框架：让 Agent 先在计划空间中采样多个可行未来，再用价值和约束信号筛选、修正与执
+行。
+2 研究目标与总体思路
+2.1 研究目标
+本方案旨在构建一个面向长程任务的 Diffusion-based plan-centric Agent 框架，满足以下目
+标：
+1. 全局规划性：在执行动作前生成多步候选计划，而非只选择下一步动作。
+2. 多模态未来覆盖：能够生成多条语义不同、策略不同的候选计划，覆盖不同可能路径。
+3. 价值感知：计划生成不只是模仿历史轨迹，还要被任务成功、长期回报和约束满足引导。
+4. 有限承诺：不一次性执行完整计划，而是在每轮执行一个动作或一个子目标后重新规划。
+5. 可执行性：计划必须能映射到真实 action/tool call，包括工具名、参数、前置条件和后置检
+查。
+6. 可审计性：计划应具有结构化表示，方便诊断早期错误、约束违规和执行偏离。
+2.2 框架命名：DiPLaN
+本文将提出的框架命名为DiPLaN:Diffusion Planner for Long-Horizon Agentic Rea-
+soning。其核心不是让扩散模型直接输出最终答案，而是让扩散模型生成计划轨迹，再由执行器
+完成动作或工具调用。
+整体流程为：
+Task ! Planning State Encoder ! Diffusion Plan Generator ! Plan Evaluator ! Executable Action Decoder ! Execution and Replanning.
+(1)
+用户任务 PlanningState Diffusion guidanceValue/Constraint Executable Environment
+目标与约束 Encoder PlanGenerator Evaluator ActionDecoder Tool/API
+observation
+stateupdate
+图 1: DiPLaN 的总体架构：扩散模型生成计划分布，价值/约束模块选择或引导计划，执行器只
+执行下一步并循环重规划。
+3 形式化问题定义
+考虑一个长程 Agent 环境
+E = (S,A,T,O,r,H), (2)
+4
+
+===== PAGE 6 =====
+Diffusion-Based Plan-Centric Long-Horizon Reasoning 研究方案报告
+其中 S 是状态空间，A 是动作或工具调用空间，T 是转移机制，O 是观测空间，r 是奖励或评估
+信号，H 是任务最大步数。Agent 在时刻 t 观察到历史
+h = (o ,a ,o ,...,o ), (3)
+t 0 0 1 t
+并选择动作 a 2 A(h )。标准 step-wise policy 直接学习
+t t
+π(a j h ), (4)
+t t
+而 plan-centric policy 首先生成一个未来计划
+p = (u ,u ,...,u ), (5)
+1 2 K
+其中 u 可以是子目标、工具调用、API 参数、网页动作或知识图谱关系选择。执行器再将计划前
+k
+缀映射为动作。
+本报告关注的核心对象是条件计划分布
+q (p j h ,g,c), (6)
+θ t
+其中 g 是任务目标，c 是显式约束，例如预算、时间、必须使用的工具、禁止操作、目标实体或安
+全约束。我们的目标不是直接最大化一步动作概率，而是生成一组候选计划 fp(i)gN ，并基于长
+i=1
+期价值选择可执行前缀。
+定义计划价值：
+" #
+HX−1
+V(p;h ,g,c) = E r(s ,a ,s ) j p,h ,g,c (cid:0)λ(cid:1)Viol(p,c), (7)
+t ℓ ℓ ℓ+1 t
+ℓ=t
+其中 Viol(p,c) 是约束违规程度。理想计划生成器应在高价值、可执行、低违规区域给出较高概率。
+4 计划表示：从动作序列到结构化计划轨迹
+4.1 为什么不能只生成 action sequence
+如果 diffusion 直接生成低层 action sequence，会遇到三个问题：
+• 低层动作强依赖环境细节，跨任务迁移差；
+• 动作参数可能是自然语言、API JSON、网页元素选择的混合对象，离散化困难；
+• 长程计划需要层级结构，仅用扁平序列难以表达前置条件和检查点。
+因此，DiPLaN 使用层级计划表示：
+p = f(z ,ρ ,χ )gK , (8)
+k k k k=1
+其中 z 是第 k 个子目标或 plan token，ρ 是可执行动作模板，χ 是检查条件或约束。
+k k k
+例如，在工具调用任务中，一个计划单元可以写成：
+u = [tool = Search, input = query, check = evidence found]. (9)
+k
+在 KGQA 中，一个计划单元可以是关系选择、实体扩展或路径约束。在 Web task 中，它可以是
+“搜索商品、筛选价格、打开详情页、验证库存”等子目标。
+5
+
+===== PAGE 7 =====
+Diffusion-Based Plan-Centric Long-Horizon Reasoning 研究方案报告
+4.2 连续潜变量计划空间
+为了适配 diffusion，我们不直接在原始文本计划上加噪，而是先将结构化计划映射到连续潜
+变量空间：
+e = Enc (p) 2 RK×d. (10)
+ϕ
+扩散模型在 e 上建模，再由解码器得到结构化计划：
+pˆ= Dec (e). (11)
+ω
+这种 latent plan diffusion 的优势是：连续空间便于去噪、插值、多样化采样和价值引导；结构化
+解码器则保证计划最终能转化为工具或动作。
+5 DiPLaN 方法设计
+5.1 模块一：Planning State Encoder
+Planning State Encoder 将当前任务、历史观测、已完成步骤、失败记录和约束编码为条件向
+量：
+c = f (h ,g,C,m ), (12)
+t η t t
+其中 m 是结构化记忆，包括已访问页面、已查询工具结果、已验证事实、已失败动作和剩余约
+t
+束。该模块可以由 LLM encoder、Transformer encoder 或任务专用 encoder 实现。
+关键是将长上下文压缩成规划状态，而不是把完整历史无差别塞回模型。一个可执行设计是
+维护四类 memory：
+1. Goal memory：最终目标、用户偏好、必须满足的硬约束；
+2. Evidence memory：已获得事实、工具返回、网页信息、KG 节点；
+3. Execution memory：已执行动作、失败动作、环境状态变化；
+4. Plan memory：上一轮计划、偏离原因、重规划触发条件。
+5.2 模块二：Diffusion Plan Generator
+给定条件 c ，DiPLaN 在潜在计划空间中运行扩散过程。Forward process 为：
+t
+(cid:0)p (cid:1)
+q(e j e ) = N α¯ e ,(1(cid:0)α¯ )I , (13)
+n 0 n 0 n
+其中 e 是真实或伪专家计划的连续表示，n 是 diffusion step。Reverse process 学习：
+0
+p θ (e n−1 j e n ,c t ) = N (µ θ (e n ,n,c t ),Σ n ). (14)
+训练目标可写为：
+h (cid:13) (cid:0)p p (cid:1)(cid:13) i
+L (θ) = E w(R(e )) (cid:13) ϵ(cid:0)ϵ α¯ e + 1(cid:0)α¯ ϵ,n,c (cid:13)2 , (15)
+diff e0,n,ϵ 0 θ n 0 n t 2
+其中 w(R) 是决策权重，使高回报计划对训练影响更大。这一点区别于普通行为克隆：模型不是
+学习平均计划，而是学习高价值计划分布。
+6
+
+===== PAGE 8 =====
+Diffusion-Based Plan-Centric Long-Horizon Reasoning 研究方案报告
+5.3 模块三：Value-Guided Plan Refinement
+扩散模型生成候选计划后，需要价值模型和约束模型进行引导。定义价值模型：
+V (e,c ) (cid:25) E[R(p) j e,c ], (16)
+ψ t t
+约束模型：
+C (e,c ) (cid:25) Viol(p,C). (17)
+ξ t
+在采样阶段，可以采用 classifier-free guidance 或 value guidance：
+ϵ˜ = ϵ (e ,n,c )(cid:0)γ r V (e ,c )+γ r C (e ,c ), (18)
+θ θ n t V en ψ n t C en ξ n t
+其中 γ 控制朝高价值方向移动，γ 控制远离约束违规区域。对于不可微的 LLM judge 或符号
+V C
+约束检查器，可以用 reranking 或 rejection sampling 替代梯度引导。
+5.4 模块四：Feasibility Projection and Tool Decoder
+扩散生成的计划可能语义合理但不可执行。因此需要可行性投影：
+Π : pˆ7! pexec, (19)
+exec
+它完成三件事：
+1. 将抽象子目标转成具体 action/tool call；
+2. 检查工具参数 schema、前置条件和权限；
+3. 若不可执行，则进行局部修复或替换为候选可行动作。
+例如工具调用可以统一表示为：
+a = (tool_name,arguments,expected_observation,verification). (20)
+t
+5.5 模块五：Receding-Horizon Execution
+DiPLaN 不一次性执行完整计划，而是采用有限承诺机制。每轮生成候选计划 fp gN ，选择
+i i=1
+最佳计划 p⋆，只执行其第一个 action 或第一个子目标：
+a = Head(Π (p⋆)), (21)
+t exec
+随后接收新 observation 并重新规划。这种机制可以避免早期评估误差被完整执行放大，也可以处
+理工具失败和环境变化。
+7
+
+===== PAGE 9 =====
+Diffusion-Based Plan-Centric Long-Horizon Reasoning 研究方案报告
+6 推理算法
+Algorithm 1 DiPLaN Inference: Diffusion-Based Receding-Horizon Planning
+1: Input: task goal g, constraints C, initial observation o 0 , diffusion planner p θ , value model V ψ ,
+constraint checker C, executor X
+2: Initialize history h 0 = (o 0 ) and memory m 0
+3: for t = 0,1,...,H (cid:0)1 do
+4: Encode planning condition c t = f η (h t ,g,C,m t )
+5: Sample N latent plans e(1),...,e(N) (cid:24) p θ (e j c t )
+6: Decode plans p(i) = Dec ω (e(i))
+7: Project each plan to executable form p˜(i) = Π exec (p(i))
+8: Score S i = V ψ (e(i),c t )(cid:0)λC(p˜(i),C)+βD(p(i))
+9: Select i⋆ = argmax i S i
+10: Execute only the first action a t = Head(p˜(i⋆)) via executor X
+11: Observe o t+1 , update h t+1 and structured memory m t+1
+12: if goal achieved or terminal condition met then
+13: break
+14: end if
+15: end for
+16: Return: final answer, trajectory, plan trace, diagnostics
+这里 D(p) 是计划多样性或覆盖度项，避免所有候选计划塌缩到同一路径。实践中可使用最大
+边际相关性、embedding 距离或子目标覆盖率作为多样性指标。
+7 训练方案
+7.1 数据来源
+DiPLaN 需要计划轨迹数据。可行数据来源包括：
+1. 专家或规则轨迹：KGQA 中的 oracle paths、ALFWorld 中的成功 action sequences、工具任
+务中的人工 workflow；
+2. 强 Agent 轨迹：由 GPT-4o、Claude、Gemini 或已有 planning agent 生成成功轨迹；
+3. 自生成轨迹：让 ReAct/Reflexion/beam/搜索方法在训练任务上采样大量成功与失败轨迹；
+4. hindsight relabeling：把失败轨迹中仍然有价值的前缀转成局部子目标训练样本；
+5. 合成任务生成：对 KGQA、API workflow 或 web form task 自动构造可验证任务。
+8
+
+===== PAGE 10 =====
+Diffusion-Based Plan-Centric Long-Horizon Reasoning 研究方案报告
+7.2 计划抽取与标准化
+原始轨迹通常是 observation-action 序列，需要转成计划单元：
+(o 0 ,a 0 ,o 1 ,...,a H−1 ,o H ) 7! (u 1 ,...,u K ). (22)
+计划抽取可以通过 LLM summarizer 或规则模板完成。为了避免计划过于自由，需要定义 schema：
+u = (subgoal,tool/action,arguments,precondition,postcondition,evidence). (23)
+k
+7.3 三阶段训练
+建议采用三阶段训练。
+7.3.1 阶段一：计划自编码器训练
+训练 encoder-decoder 将结构化计划压缩到连续潜变量并重构：
+L
+AE
+= E p∼D[(cid:0)logP
+ω
+(p j Enc
+ϕ
+(p))]+ηkek2
+2
+. (24)
+该阶段确保 latent plan space 可解码、可插值、可执行。
+7.3.2 阶段二：决策加权扩散训练
+用计划回报或成功标签加权扩散损失：
+h i
+L = E w kϵ (cid:0)ϵ (e ,n,c )k2 , (25)
+DWD i i θ i,n i 2
+其中
+w = expfα(cid:1)Normalize(R )g(cid:1)1ffeasible(p ) = 1g. (26)
+i i i
+这让模型偏向学习成功且可执行的计划，而不是简单模仿所有行为。
+7.3.3 阶段三：价值模型与约束模型训练
+训练价值模型可采用回归、排序或偏好学习：
+X
+L = (V (e ,c )(cid:0)R )2, (27)
+V ψ i i i
+i
+或者对成功计划 p+ 和失败计划 p − 使用 pairwise ranking：
+(cid:0) (cid:1)
+L = (cid:0)logσ V (e+,c)(cid:0)V (e − ,c) . (28)
+rank ψ ψ
+约束模型则用可行/不可行标签训练，或直接调用 symbolic checker。
+8 理论分析框架
+本报告的理论目标不是声称 diffusion 一定优于 MCTS，而是给出一个可证明的研究路线：当
+计划分布具有覆盖性、评价器具有一定排序正确性、执行采用有限承诺时，Diffusion plan-centric
+机制可以避免纯局部贪心的早期短视陷阱。
+9
+
+===== PAGE 11 =====
+Diffusion-Based Plan-Centric Long-Horizon Reasoning 研究方案报告
+8.1 计划覆盖假设
+设 P⋆(s) 是从状态 s 出发的 ϵ-近优计划集合：
+ϵ
+P⋆(s) = fp : V(p;s) (cid:21) V⋆(s)(cid:0)ϵg. (29)
+ϵ
+若扩散计划器满足覆盖条件
+q (P⋆(s) j s,g,c) (cid:21) ρ, (30)
+θ ϵ
+则采样 N 个计划后，至少一个近优计划被采中的概率为：
+Pr(9i : p 2 P⋆(s)) (cid:21) 1(cid:0)(1(cid:0)ρ)N. (31)
+i ϵ
+因此只要
+log(1/δ)
+N (cid:21) , (32)
+ρ
+就能以至少 1(cid:0)δ 的概率覆盖近优计划。这体现了 diffusion 多样化采样的理论价值：它不是寻找
+单一路径，而是从计划分布中覆盖多个可能未来。
+8.2 评价器排序误差
+设评价器 Vˆ 满足一致误差界：
+jVˆ(p;s)(cid:0)V(p;s)j (cid:20) ζ, 8p 2 P . (33)
+N
+如果采样集合中包含一个 ϵ-近优计划，则 reranking 选出的计划 pˆ满足：
+V(pˆ;s) (cid:21) V⋆(s)(cid:0)ϵ(cid:0)2ζ. (34)
+该结论为实验设计提供了清晰方向：需要分别提高 plan coverage 和 evaluator calibration。
+8.3 有限承诺降低错误放大
+若完整执行计划时，每一步计划偏差以概率 p 发生，则长程失败概率大致随 H 增长而累积。
+e
+receding-horizon 执行通过每步重新规划，将错误影响限制在局部区域。形式上，若单次执行后状
+态偏离可被重新规划修正的概率为 p ，则可恢复机制使有效错误率从 p 降为 p (1(cid:0)p )。这给出
+r e e r
+为什么“生成完整计划但只执行前缀”比一次性执行完整计划更稳健。
+9 实验设计
+9.1 Benchmark 选择
+建议采用由易到难的四类任务。
+任务类型 代表 benchmark 选择原因
+10
+
+===== PAGE 12 =====
+Diffusion-Based Plan-Centric Long-Horizon Reasoning 研究方案报告
+知识图谱多跳推理 CWQ, WebQSP, GrailQA 状态和转移较结构化，适合验证计划
+覆盖、路径选择和早期短视陷阱。
+文本工具/家居环 ALFWorld, ScienceWorld 动作序列长，有明确成功条件，适合
+境 分析 first-error step 和 recovery。
+工具调用工作流 ToolBench, API-Bank, 检验多工具选择、参数生成、工具依
+StableToolBench 赖和可执行性。
+网页/GUI 长程任 WebArena, WebVoyager, 检验真实环境下的动态重规划、约束
+务 MiniWoB++ 记忆和执行偏离。
+9.2 Baselines
+必须比较三类 baseline：
+1. Reasoning baselines：CoT、ReAct、Reflexion、Self-Consistency；
+2. Search/planning baselines：beam search、Tree-of-Thoughts、RAP、LATS、MCTS-style
+lookahead、FLARE；
+3. Tool-specific baselines：ReWOO、LLMCompiler、Plan-and-Act、Pre-Act、GoalAct 等。
+9.3 指标体系
+报告应避免只看 success rate，建议使用机制级指标：
+指标 含义 方向
+Success Rate 最终任务完成率 越高越好
+First-Error Step 首个不可恢复错误出现的步数 越高越好
+Recovery@Error 首错后仍能恢复并完成任务的概率 越高越好
+Trap@1 第一步选择短视陷阱动作的比例 越低越好
+Plan Feasibility 生成计划可被执行器解析并执行的比例 越高越好
+Constraint Viola- 预算、工具 schema、安全约束等违规率 越低越好
+tion
+Plan-Execution 实际执行轨迹与计划前缀的一致性 越高越好
+Consistency
+Token/Latency 推理 token、工具调用次数、总耗时 越低越好
+Cost
+Diversity-Coverage 候选计划覆盖不同可行策略的程度 适中且越高越
+好
+11
+
+===== PAGE 13 =====
+Diffusion-Based Plan-Centric Long-Horizon Reasoning 研究方案报告
+9.4 核心消融实验
+1. 去掉 value guidance，只用无条件或条件 diffusion；
+2. 去掉 constraint checker，观察可执行性和违规率；
+3. 一次性执行完整计划 vs receding-horizon 执行；
+4. latent diffusion vs discrete diffusion vs LLM-only plan sampling；
+5. 固定采样数 N 下比较不同 plan diversity 机制；
+6. oracle evaluator vs learned evaluator，测试评价器误差敏感性；
+7. 只生成低层动作 vs 生成层级计划，测试计划表示的重要性。
+10 可执行实施路线
+10.1 MVP 版本
+为了提高可行性，建议第一阶段不直接挑战开放网页任务，而是从 KGQA 或 ALFWorld 开
+始。
+MVP 推荐
+首选任务：KGQA。将状态定义为当前图节点或已访问路径，将动作定义为下一条关系或
+实体扩展，将计划定义为未来 relation path。扩散模型在 relation-path latent space 中生成
+候选路径，value model 评估路径到答案的可能性。这一设置最适合验证“plan distribution
+generation”是否优于 step-wise relation selection。
+MVP 的最小系统包含：
+1. 数据：CWQ/WebQSP 上的 oracle subgraph 与成功路径；
+2. 表示：relation path 或 subgoal path 的 token 序列；
+3. 模型：Transformer-based latent diffusion planner；
+4. 评估：路径是否到达正确答案，Hits@1，Trap@1，First-Error Step；
+5. Baselines：single-step、beam search、lookahead、FLARE 或 MCTS。
+10.2 系统实现模块
+模块 输入输出 推荐实现
+State Encoder 任务、历史、约束 ! c Transformer encoder 或 LLM
+t
+embedding + MLP
+12
+
+===== PAGE 14 =====
+Diffusion-Based Plan-Centric Long-Horizon Reasoning 研究方案报告
+Plan Autoencoder 计划 p $ e seq2seq Transformer, VAE-
+style encoder
+Diffusion Planner c ! e(1:N) DiT/Transformer denoiser,
+t
+DDIM sampling
+Value Model (e,c ) ! Vˆ pairwiseranker或scalarcritic
+t
+Constraint Checker plan ! feasible/violation 规则检查器 + LLM verifier
+Tool Decoder plan ! tool/action JSON schema-constrained decoder
+Executor action ! observation 环境API或benchmarkwrap-
+per
+Diagnostics trajectory ! metrics 日志分析脚本
+10.3 12 周研究计划
+阶段 工作内容 产出
+第 1-2 周 文献整理、任务选择、数据 schema related work、数据处理脚本
+设计
+第 3-4 周 构建 KGQA/ALFWorld 轨迹数据 训练/验证/测试计划数据集
+与计划抽取器
+第 5-6 周 训练planautoencoder与初版diffu- 可采样候选计划的模型
+sion planner
+第 7-8 周 训练 value model、constraint 完整离线 planner
+checker 与 reranking 模块
+第 9 周 接入 receding-horizon executor 端到端 Agent
+第 10 周 Baseline 与消融实验 主结果表和曲线
+第 11 周 机制分析：Trap@1、first-error、re- 诊断图表
+covery、failure type
+第 12 周 写作、整理附录、开源代码结构 投稿级 draft
+11 预期结果与论文故事线
+理想实验结果应支持以下故事：
+1. Step-wise reasoning 在 horizon 增大时快速退化；
+2. Beam search 提升有限，因为它仍然依赖局部或前缀评分；
+3. MCTS/FLARE 类方法证明显式规划有效，但成本较高且缺少跨任务 amortization；
+13
+
+===== PAGE 15 =====
+Diffusion-Based Plan-Centric Long-Horizon Reasoning 研究方案报告
+4. DiPLaN 通过学习成功计划分布，在相同或可控预算下生成更高质量、多样化、可恢复的计
+划；
+5. DiPLaN 的优势不仅体现在成功率，还体现在更低 Trap@1、更晚 first-error、更高 recovery
+和更高 plan feasibility。
+如果结果成立，论文的核心贡献可以概括为：
+我们将长程 Agent 规划从 online tree search 重新表述为 conditional generative plan-
+ning problem，并提出一个 value-guided diffusion planner，使未来轨迹分布能够在执
+行前显式生成、筛选、修复和有限承诺执行。
+12 原创性分析
+相较于已有 plan-then-act 或 MCTS-lookahead 方法，DiPLaN 的原创性体现在以下方面。
+1. 计划分布而非单一路径：现有方法常搜索或生成一条计划，DiPLaN 学习多模态计划分布。
+2. amortized planning：通过离线学习成功计划轨迹，减少每个新任务从零搜索的成本。
+3. value-guided denoising：不是先生成再被动打分，而是在去噪过程中引入价值和约束引导。
+4. latent structured plan space：不是直接扩散自然语言，也不是直接扩散低层动作，而是
+在可解码的结构化计划潜空间中生成。
+5. 机制级诊断：以 Trap@1、First-Error Step、Recovery、Plan-Execution Consistency 等指标
+分析长程规划行为，而不只报告最终成功率。
+13 风险与解决方案
+风险 表现 解决方案
+离散动作扩散困难 计划 token 不连续，生成不稳定 使用 latent plan diffusion 或
+discretediffusion；先从KGQA
+path token 做 MVP。
+计划不可执行 生成合理但工具 schema 不匹配 增加 schema-constrained de-
+coder 和 feasibility projection。
+评价器不可靠 reranking 选中看似好但实际差 使用多评价器集成、规则约束、
+的计划 oracle 子任务和 calibration。
+采样成本高 diffusion 多步采样耗时 DDIM/consistency distilla-
+tion、 少 步 采 样、trajectory
+memory。
+计划与执行脱节 执行时环境变化导致计划失效 receding-horizon 重规划和 de-
+viation monitor。
+14
+
+===== PAGE 16 =====
+Diffusion-Based Plan-Centric Long-Horizon Reasoning 研究方案报告
+创新被认为只是替换 方法贡献不清晰 强调生成式计划分布学习、
+MCTS amortized planning 和 value-
+guided denoising。
+14 建议论文结构
+1. Introduction: reasoning not planning；长程任务需要计划分布而非局部推理。
+2. Related Work: LLM agents, plan-then-act, MCTS planning, diffusion for decision making。
+3. Problem Formulation: 长程 Agent 任务、计划空间、价值和约束。
+4. Method: DiPLaN 架构、latent plan diffusion、value-guided sampling、executor。
+5. Theoretical Analysis: coverage、evaluator error、limited commitment。
+6. Experiments: KGQA、ALFWorld、tool-use、ablation、mechanistic diagnostics。
+7. Conclusion: diffusion planning as a new plan-centric paradigm。
+15 结论
+本报告提出了一个完整、可执行且具有较强原创性的研究方向：用扩散模型构建 plan-centric
+长程Agent推理框架。与step-wisereasoning相比，该框架显式生成未来计划；与MCTS-lookahead
+相比，它学习条件计划分布并支持 amortized planning；与普通 diffusion decision-making 相比，
+它强调结构化计划、工具可执行性、约束验证和 receding-horizon 执行。
+最适合的研究切入点是：先在 KGQA 或 ALFWorld 上验证 diffusion planner 能否降低早期
+短视错误、推迟首错位置并提高恢复能力；随后扩展到工具调用和网页任务。若实验结果支持该
+机制，该方向可以形成一篇围绕“Generative Planning for Long-Horizon LLM Agents”的较有潜
+力论文。
+15
+
+===== PAGE 17 =====
+Diffusion-Based Plan-Centric Long-Horizon Reasoning 研究方案报告
+参考文献
+[1] Wang, Z. et al. Why Reasoning Fails to Plan: A Planning-Centric Analysis of Long-Horizon
+Decision Making in LLM Agents. arXiv:2601.22311, 2026.
+[2] Janner, M., Du, Y., Tenenbaum, J., and Levine, S. Planning with Diffusion for Flexible
+Behavior Synthesis. ICML, 2022.
+[3] Ajay, A.etal.Is Conditional Generative Modeling All You Need for Decision Making? ICLR,
+2023.
+[4] Chi, C. et al. Diffusion Policy: Visuomotor Policy Learning via Action Diffusion. RSS, 2023.
+[5] Yao, S. et al. ReAct: Synergizing Reasoning and Acting in Language Models. ICLR, 2023.
+[6] Shinn, N. et al. Reflexion: Language Agents with Verbal Reinforcement Learning. NeurIPS,
+2023.
+[7] Yao, S. et al. Tree of Thoughts: Deliberate Problem Solving with Large Language Models.
+NeurIPS, 2023.
+[8] Hao, S. et al. Reasoning with Language Model is Planning with World Model. EMNLP, 2023.
+[9] Zhou, A. et al. Language Agent Tree Search Unifies Reasoning, Acting, and Planning in
+Language Models. ICML, 2024.
+[10] Sun, J. et al. Think-on-Graph: Deep and Responsible Reasoning of Large Language Model on
+Knowledge Graph. ICLR, 2024.
+[11] Chen, L. et al. Plan-on-Graph: Self-Correcting Adaptive Planning of Large Language Model
+on Knowledge Graphs. NeurIPS, 2024.
+[12] Shridhar, M. et al. ALFWorld: Aligning Text and Embodied Environments for Interactive
+Learning. ICLR, 2021.
+[13] Qin, Y. et al. ToolLLM: Facilitating Large Language Models to Master 16000+ Real-world
+APIs. arXiv:2307.16789, 2023.
+[14] Wu,Q.etal.AutoGen: EnablingNext-GenLLMApplicationsviaMulti-AgentConversations.
+2024.
+16

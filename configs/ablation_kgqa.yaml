@@ -1,0 +1,52 @@
+{
+  "test_path": "data/processed/kgqa_test.jsonl",
+  "seed": 42,
+  "experiments": [
+    {
+      "name": "full_diplan",
+      "options": {
+        "num_candidates": 16,
+        "use_value_guidance": true,
+        "use_constraint_checker": true,
+        "receding_horizon": true
+      }
+    },
+    {
+      "name": "no_value_guidance",
+      "options": {
+        "num_candidates": 16,
+        "use_value_guidance": false,
+        "use_constraint_checker": true,
+        "receding_horizon": true
+      }
+    },
+    {
+      "name": "no_constraint_checker",
+      "options": {
+        "num_candidates": 16,
+        "use_value_guidance": true,
+        "use_constraint_checker": false,
+        "receding_horizon": true
+      }
+    },
+    {
+      "name": "no_receding_horizon",
+      "options": {
+        "num_candidates": 16,
+        "use_value_guidance": true,
+        "use_constraint_checker": true,
+        "receding_horizon": false
+      }
+    },
+    {
+      "name": "low_candidate_budget",
+      "options": {
+        "num_candidates": 4,
+        "use_value_guidance": true,
+        "use_constraint_checker": true,
+        "receding_horizon": true
+      }
+    }
+  ]
+}
+
