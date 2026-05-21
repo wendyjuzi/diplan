@@ -1,1 +1,8 @@
 ﻿ars-codex-src/
+runs/
+results/
+experiments/
+data/
+__pycache__/
+*.pyc
+*.pt

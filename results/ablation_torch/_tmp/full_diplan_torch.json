@@ -1,8 +1,0 @@
-{
-  "test_path": "data/real_processed/kgqa_test.jsonl",
-  "seed": 42,
-  "num_candidates": 12,
-  "receding_horizon": true,
-  "use_value_model": true,
-  "use_cuda": false
-}
