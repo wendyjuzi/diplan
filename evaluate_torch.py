@@ -182,6 +182,41 @@ def _expected_len_from_prior(
     return float(bucket_mean.get(b, global_mean))
 
 
+def _resolve_prefix_step_alpha(
+    row: Dict,
+    cfg: Dict,
+    default_alpha: float,
+) -> Tuple[float, str]:
+    if not bool(cfg.get("adaptive_prefix_alpha_enabled", False)):
+        return float(default_alpha), "fixed"
+
+    mode = str(cfg.get("adaptive_prefix_alpha_mode", "dataset")).lower()
+    ds = str(row.get("dataset", "")).lower()
+
+    ds_map_raw = cfg.get("adaptive_prefix_alpha_by_dataset", {}) or {}
+    ds_map = {str(k).lower(): float(v) for k, v in ds_map_raw.items()} if isinstance(ds_map_raw, dict) else {}
+
+    # Priority 1: dataset-specific alpha.
+    if mode in {"dataset", "hybrid", "dataset_then_len"} and ds in ds_map:
+        return float(ds_map[ds]), f"dataset:{ds}"
+
+    # Priority 2: query-length heuristic fallback.
+    if mode in {"query_len", "hybrid", "dataset_then_len"}:
+        q_len = len(row.get("query_tokens", []))
+        short_thr = int(cfg.get("adaptive_prefix_alpha_query_len_short_thr", 10))
+        long_thr = int(cfg.get("adaptive_prefix_alpha_query_len_long_thr", 18))
+        short_alpha = float(cfg.get("adaptive_prefix_alpha_short", max(0.0, default_alpha * 0.25)))
+        long_alpha = float(cfg.get("adaptive_prefix_alpha_long", default_alpha))
+        mid_alpha = float(cfg.get("adaptive_prefix_alpha_mid", default_alpha))
+        if q_len <= short_thr:
+            return short_alpha, f"query_len:short<=${short_thr}".replace("$", "")
+        if q_len >= long_thr:
+            return long_alpha, f"query_len:long>=${long_thr}".replace("$", "")
+        return mid_alpha, f"query_len:mid({short_thr},{long_thr})"
+
+    return float(default_alpha), "fixed_fallback"
+
+
 def _dedupe_with_count(candidates: List[List[str]]) -> Tuple[List[List[str]], Dict[Tuple[str, ...], int]]:
     counts: Dict[Tuple[str, ...], int] = defaultdict(int)
     out: List[List[str]] = []
@@ -277,6 +312,47 @@ def _score_candidates(
 
 
 @torch.no_grad()
+def _prefix_step_penalties(
+    value_model: ValueRanker | None,
+    path_vocab,
+    query_vocab,
+    query_tokens: List[str],
+    candidates: List[List[str]],
+    device: torch.device,
+    gamma: float = 0.85,
+) -> List[float]:
+    if value_model is None or not candidates:
+        return [0.0 for _ in candidates]
+    q = query_vocab.encode(query_tokens, add_bos_eos=False, max_len=24)
+    if not q:
+        q = [query_vocab.stoi[PAD]]
+    penalties = [0.0 for _ in candidates]
+    max_len = max(len(c) for c in candidates) if candidates else 0
+    for step in range(1, max_len + 1):
+        rows = []
+        idxs = []
+        for i, c in enumerate(candidates):
+            if len(c) < step:
+                continue
+            pref = c[:step]
+            p = path_vocab.encode(pref, add_bos_eos=False, max_len=8)
+            if not p:
+                p = [path_vocab.stoi[PAD]]
+            rows.append((q, p, 0.0))
+            idxs.append(i)
+        if not rows:
+            continue
+        q_ids, p_ids, _ = collate_value(rows, query_vocab.stoi[PAD], path_vocab.stoi[PAD])
+        s = value_model(q_ids.to(device), p_ids.to(device)).detach().cpu().tolist()
+        s_max = max(s)
+        decay = gamma ** (step - 1)
+        for ii, sv in zip(idxs, s):
+            deficit = max(0.0, s_max - float(sv))
+            penalties[ii] += decay * deficit
+    return penalties
+
+
+@torch.no_grad()
 def _predict_diplan(
     row: Dict,
     planner: DiffusionPlanner | MLPPlanner,
@@ -302,6 +378,8 @@ def _predict_diplan(
     rerank_memory_bonus: float,
     rerank_stage2_length_penalty_alpha: float,
     rerank_prefix_consensus_weight: float,
+    prefix_step_penalty_alpha: float,
+    prefix_step_penalty_gamma: float,
     save_candidate_pool_topk: int,
 ) -> Dict:
     max_steps = int(row["constraints"].get("max_steps", 8))
@@ -354,6 +432,17 @@ def _predict_diplan(
             expected_len=expected_total_len,
             length_penalty_alpha=length_penalty_alpha,
         )
+        prefix_penalties = _prefix_step_penalties(
+            value_model=value_model,
+            path_vocab=path_vocab,
+            query_vocab=query_vocab,
+            query_tokens=query_tokens,
+            candidates=cands,
+            device=device,
+            gamma=prefix_step_penalty_gamma,
+        )
+        if prefix_step_penalty_alpha > 0.0:
+            scores = [s - prefix_step_penalty_alpha * p for s, p in zip(scores, prefix_penalties)]
         all_candidates.extend(cands)
         idx_sorted = sorted(range(len(cands)), key=lambda i: scores[i], reverse=True)
         best = idx_sorted[0]
@@ -387,6 +476,7 @@ def _predict_diplan(
                         "first_hop_consensus": (
                             first_hop_counts.get(cands[i][0], 0) / max(1, total_first) if cands[i] else 0.0
                         ),
+                        "prefix_penalty": float(prefix_penalties[i]) if i < len(prefix_penalties) else 0.0,
                     }
                 )
         last_plan = cands[best]
@@ -450,6 +540,17 @@ def _predict_diplan(
             expected_len=expected_remaining,
             length_penalty_alpha=length_penalty_alpha,
         )
+        prefix_penalties = _prefix_step_penalties(
+            value_model=value_model,
+            path_vocab=path_vocab,
+            query_vocab=query_vocab,
+            query_tokens=rem_q,
+            candidates=cands,
+            device=device,
+            gamma=prefix_step_penalty_gamma,
+        )
+        if prefix_step_penalty_alpha > 0.0:
+            scores = [s - prefix_step_penalty_alpha * p for s, p in zip(scores, prefix_penalties)]
         all_candidates.extend(cands)
         uniq_vals.append(uniq)
         idx_sorted = sorted(range(len(cands)), key=lambda i: scores[i], reverse=True)
@@ -483,6 +584,7 @@ def _predict_diplan(
                         "first_hop_consensus": (
                             first_hop_counts.get(cands[i][0], 0) / max(1, total_first) if cands[i] else 0.0
                         ),
+                        "prefix_penalty": float(prefix_penalties[i]) if i < len(prefix_penalties) else 0.0,
                     }
                 )
         picked = None
@@ -597,6 +699,9 @@ def main() -> None:
             emb_dim=v_cfg["emb_dim"],
             q_pad_id=v_cfg["q_pad_id"],
             p_pad_id=v_cfg["p_pad_id"],
+            architecture=str(v_cfg.get("architecture", "legacy")),
+            hidden_dim=int(v_cfg.get("hidden_dim", 256)),
+            dropout=float(v_cfg.get("dropout", 0.1)),
         ).to(device)
         value_model.load_state_dict(value_ckpt["model_state"])
         value_model.eval()
@@ -644,9 +749,19 @@ def main() -> None:
     rerank_memory_bonus = float(cfg.get("rerank_memory_bonus", 0.0))
     rerank_stage2_length_penalty_alpha = float(cfg.get("rerank_stage2_length_penalty_alpha", 0.0))
     rerank_prefix_consensus_weight = float(cfg.get("rerank_prefix_consensus_weight", 0.0))
+    prefix_step_penalty_alpha = float(cfg.get("prefix_step_penalty_alpha", 0.0))
+    prefix_step_penalty_gamma = float(cfg.get("prefix_step_penalty_gamma", 0.85))
     save_candidate_pool_topk = int(cfg.get("save_candidate_pool_topk", 0))
+    adaptive_prefix_alpha_enabled = bool(cfg.get("adaptive_prefix_alpha_enabled", False))
+    if adaptive_prefix_alpha_enabled:
+        print(
+            "[eval] adaptive_prefix_alpha enabled, "
+            f"mode={str(cfg.get('adaptive_prefix_alpha_mode', 'dataset')).lower()}, "
+            f"default_alpha={prefix_step_penalty_alpha:.3f}"
+        )
     records = []
     memory_prefilter_dropped = 0
+    alpha_bucket_counter: Dict[str, int] = defaultdict(int)
     for row in rows:
         mem_cands = (
             _retrieve_memory_candidates(row["query_tokens"], token_to_ids, path_bank, top_k=memory_top_k)
@@ -656,6 +771,12 @@ def main() -> None:
         if use_memory_retrieval and memory_prefilter_feasible:
             mem_cands, dropped = _filter_feasible_candidates(mem_cands, row["constraints"])
             memory_prefilter_dropped += dropped
+        row_prefix_alpha, alpha_source = _resolve_prefix_step_alpha(
+            row=row,
+            cfg=cfg,
+            default_alpha=prefix_step_penalty_alpha,
+        )
+        alpha_bucket_counter[f"{alpha_source}:{row_prefix_alpha:.3f}"] += 1
         pred = _predict_diplan(
             row=row,
             planner=planner,
@@ -686,6 +807,8 @@ def main() -> None:
             rerank_memory_bonus=rerank_memory_bonus,
             rerank_stage2_length_penalty_alpha=rerank_stage2_length_penalty_alpha,
             rerank_prefix_consensus_weight=rerank_prefix_consensus_weight,
+            prefix_step_penalty_alpha=row_prefix_alpha,
+            prefix_step_penalty_gamma=prefix_step_penalty_gamma,
             save_candidate_pool_topk=save_candidate_pool_topk,
         )
         executed = pred["executed_path"]
@@ -715,6 +838,8 @@ def main() -> None:
             "oracle_in_candidate_pool": oracle_in_candidate_pool,
             "candidate_pool_size": int(pred.get("candidate_pool_size", 0)),
             "ranking_error": bool((not success) and oracle_in_candidate_pool),
+            "prefix_step_penalty_alpha": float(row_prefix_alpha),
+            "prefix_step_penalty_alpha_source": alpha_source,
         }
         if save_candidate_pool_topk > 0:
             rec["candidate_pool_top"] = pred.get("candidate_pool_top", [])
@@ -753,6 +878,8 @@ def main() -> None:
     print(f"Evaluated {len(rows)} tasks with {method}.")
     if use_memory_retrieval and memory_prefilter_feasible:
         print(f"[memory] prefilter dropped={memory_prefilter_dropped}")
+    if adaptive_prefix_alpha_enabled:
+        print(f"[eval] adaptive alpha bucket counts={dict(alpha_bucket_counter)}")
     print(summary[method])
 
 

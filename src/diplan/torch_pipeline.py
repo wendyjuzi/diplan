@@ -276,17 +276,43 @@ class MLPPlanner(nn.Module):
 
 
 class ValueRanker(nn.Module):
-    def __init__(self, q_vocab_size: int, p_vocab_size: int, emb_dim: int, q_pad_id: int, p_pad_id: int) -> None:
+    def __init__(
+        self,
+        q_vocab_size: int,
+        p_vocab_size: int,
+        emb_dim: int,
+        q_pad_id: int,
+        p_pad_id: int,
+        architecture: str = "legacy",
+        hidden_dim: int = 256,
+        dropout: float = 0.1,
+    ) -> None:
         super().__init__()
+        self.architecture = str(architecture).lower()
+        if self.architecture not in {"legacy", "cross"}:
+            raise ValueError(f"Unsupported ValueRanker architecture: {architecture}")
         self.q_pad_id = q_pad_id
         self.p_pad_id = p_pad_id
         self.q_emb = nn.Embedding(q_vocab_size, emb_dim, padding_idx=q_pad_id)
         self.p_emb = nn.Embedding(p_vocab_size, emb_dim, padding_idx=p_pad_id)
-        self.mlp = nn.Sequential(
-            nn.Linear(emb_dim * 2, 128),
-            nn.ReLU(),
-            nn.Linear(128, 1),
-        )
+        if self.architecture == "legacy":
+            # Keep the original layout for checkpoint compatibility.
+            self.mlp = nn.Sequential(
+                nn.Linear(emb_dim * 2, 128),
+                nn.ReLU(),
+                nn.Linear(128, 1),
+            )
+        else:
+            feat_dim = emb_dim * 6
+            self.mlp = nn.Sequential(
+                nn.Linear(feat_dim, hidden_dim),
+                nn.ReLU(),
+                nn.Dropout(dropout),
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.ReLU(),
+                nn.Dropout(dropout),
+                nn.Linear(hidden_dim, 1),
+            )
 
     def _masked_mean(self, ids: torch.Tensor, emb: nn.Embedding, pad_id: int) -> torch.Tensor:
         e = emb(ids)
@@ -295,10 +321,54 @@ class ValueRanker(nn.Module):
         d = m.sum(dim=1).clamp(min=1.0)
         return s / d
 
+    def _cross_attention_mean(
+        self,
+        q_e: torch.Tensor,
+        p_e: torch.Tensor,
+        q_ids: torch.Tensor,
+        p_ids: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # q_e: [B, Q, D], p_e: [B, P, D]
+        d = q_e.size(-1)
+        scale = math.sqrt(max(1, d))
+        scores = torch.matmul(q_e, p_e.transpose(1, 2)) / scale  # [B, Q, P]
+        p_mask = (p_ids != self.p_pad_id).unsqueeze(1)  # [B,1,P]
+        scores = scores.masked_fill(~p_mask, -1e9)
+        attn_q2p = torch.softmax(scores, dim=-1)
+        q_ctx = torch.matmul(attn_q2p, p_e)  # [B,Q,D]
+        q_mask = (q_ids != self.q_pad_id).float().unsqueeze(-1)
+        q_ctx_mean = (q_ctx * q_mask).sum(dim=1) / q_mask.sum(dim=1).clamp(min=1.0)
+
+        scores_t = scores.transpose(1, 2)  # [B,P,Q]
+        q_mask_t = (q_ids != self.q_pad_id).unsqueeze(1)  # [B,1,Q]
+        scores_t = scores_t.masked_fill(~q_mask_t, -1e9)
+        attn_p2q = torch.softmax(scores_t, dim=-1)
+        p_ctx = torch.matmul(attn_p2q, q_e)  # [B,P,D]
+        p_mask_f = (p_ids != self.p_pad_id).float().unsqueeze(-1)
+        p_ctx_mean = (p_ctx * p_mask_f).sum(dim=1) / p_mask_f.sum(dim=1).clamp(min=1.0)
+        return q_ctx_mean, p_ctx_mean
+
     def forward(self, q_ids: torch.Tensor, p_ids: torch.Tensor) -> torch.Tensor:
         q = self._masked_mean(q_ids, self.q_emb, self.q_pad_id)
         p = self._masked_mean(p_ids, self.p_emb, self.p_pad_id)
-        x = torch.cat([q, p], dim=1)
+        if self.architecture == "legacy":
+            x = torch.cat([q, p], dim=1)
+            return self.mlp(x).squeeze(1)
+
+        q_e = self.q_emb(q_ids)
+        p_e = self.p_emb(p_ids)
+        q_ctx_mean, p_ctx_mean = self._cross_attention_mean(q_e, p_e, q_ids, p_ids)
+        x = torch.cat(
+            [
+                q,
+                p,
+                torch.abs(q - p),
+                q * p,
+                q_ctx_mean,
+                p_ctx_mean,
+            ],
+            dim=1,
+        )
         return self.mlp(x).squeeze(1)
 
 

@@ -87,9 +87,29 @@ def _build_pairwise_samples(
     seed: int,
     hard_negatives_by_query: Optional[Dict[Tuple[str, ...], List[List[str]]]] = None,
     near_miss_repeat: int = 2,
+    prefix_neg_per_pos: int = 0,
+    prefix_neg_repeat: int = 1,
 ):
     rng = random.Random(seed)
     all_rel = sorted(list({r for row in rows for r in row.get("oracle_path", []) if isinstance(r, str)}))
+
+    def _prefix_nearmiss(pos_tokens: List[str], count: int) -> List[List[str]]:
+        out: List[List[str]] = []
+        if len(pos_tokens) < 2 or not all_rel:
+            return out
+        for _ in range(max(0, count)):
+            cut = rng.randrange(1, len(pos_tokens))  # keep at least one correct prefix token
+            neg = list(pos_tokens[:cut])
+            gold_next = pos_tokens[cut] if cut < len(pos_tokens) else None
+            choices = [r for r in all_rel if r != gold_next] or all_rel
+            wrong = rng.choice(choices)
+            neg.append(wrong)
+            while len(neg) < len(pos_tokens):
+                neg.append(rng.choice(all_rel))
+            if neg != pos_tokens:
+                out.append(neg[: len(pos_tokens)])
+        return out
+
     samples = []
     for row in rows:
         q = query_vocab.encode(row.get("query_tokens", []), add_bos_eos=False, max_len=max_query_len)
@@ -110,6 +130,13 @@ def _build_pairwise_samples(
             if not neg:
                 neg = [path_vocab.stoi[PAD]]
             samples.append((q, pos, neg))
+        # Process-supervision style negatives: correct prefix, wrong continuation.
+        for neg_tokens in _prefix_nearmiss(pos_tokens, prefix_neg_per_pos):
+            neg = path_vocab.encode(neg_tokens, add_bos_eos=False, max_len=max_path_len)
+            if not neg:
+                continue
+            for _ in range(max(1, prefix_neg_repeat)):
+                samples.append((q, pos, neg))
         if hard_negatives_by_query:
             hard_paths = hard_negatives_by_query.get(_query_key(row.get("query_tokens", [])), [])
             oracle_first = pos_tokens[0] if pos_tokens else None
@@ -146,6 +173,8 @@ def _build_listwise_samples(
     num_negatives: int,
     hard_negatives_by_query: Optional[Dict[Tuple[str, ...], List[List[str]]]] = None,
     near_miss_repeat: int = 2,
+    prefix_neg_per_pos: int = 0,
+    prefix_neg_repeat: int = 1,
 ):
     rng = random.Random(seed)
     all_rel = sorted(list({r for row in rows for r in row.get("oracle_path", []) if isinstance(r, str)}))
@@ -162,6 +191,23 @@ def _build_listwise_samples(
             neg_tokens[j] = repl
         return neg_tokens
 
+    def _prefix_nearmiss(pos_tokens: List[str], count: int) -> List[List[str]]:
+        out: List[List[str]] = []
+        if len(pos_tokens) < 2 or not all_rel:
+            return out
+        for _ in range(max(0, count)):
+            cut = rng.randrange(1, len(pos_tokens))
+            neg = list(pos_tokens[:cut])
+            gold_next = pos_tokens[cut] if cut < len(pos_tokens) else None
+            choices = [r for r in all_rel if r != gold_next] or all_rel
+            wrong = rng.choice(choices)
+            neg.append(wrong)
+            while len(neg) < len(pos_tokens):
+                neg.append(rng.choice(all_rel))
+            if neg != pos_tokens:
+                out.append(neg[: len(pos_tokens)])
+        return out
+
     for row in rows:
         q_tokens = row.get("query_tokens", [])
         pos_tokens = row.get("oracle_path", [])
@@ -172,6 +218,21 @@ def _build_listwise_samples(
         neg_paths: List[List[int]] = []
         seen = set()
         oracle_first = pos_tokens[0] if pos_tokens else None
+        # Add process-supervision style prefix negatives first.
+        for neg_tokens in _prefix_nearmiss(pos_tokens, prefix_neg_per_pos):
+            enc = path_vocab.encode(neg_tokens, add_bos_eos=False, max_len=max_path_len)
+            if not enc:
+                continue
+            key = tuple(enc)
+            if key in seen:
+                continue
+            seen.add(key)
+            for _ in range(max(1, prefix_neg_repeat)):
+                neg_paths.append(enc)
+                if len(neg_paths) >= num_negatives:
+                    break
+            if len(neg_paths) >= num_negatives:
+                break
         if hard_negatives_by_query:
             hard_paths = hard_negatives_by_query.get(_query_key(q_tokens), [])
             for hp in hard_paths:
@@ -204,6 +265,104 @@ def _build_listwise_samples(
                 continue
             seen.add(key)
             neg_paths.append(enc)
+        if not neg_paths:
+            continue
+        if len(neg_paths) > num_negatives:
+            neg_paths = neg_paths[:num_negatives]
+        samples.append((q, pos, neg_paths))
+    return samples
+
+
+def _build_full_pool_listwise_samples(
+    pool_rows,
+    path_vocab,
+    query_vocab,
+    max_path_len: int,
+    max_query_len: int,
+    num_negatives: int,
+    seed: int,
+):
+    rng = random.Random(seed)
+    all_rel = sorted(
+        list(
+            {
+                r
+                for row in pool_rows
+                for r in (
+                    row.get("gold_path")
+                    or row.get("oracle_path")
+                    or []
+                )
+                if isinstance(r, str)
+            }
+        )
+    )
+
+    def _mutate_neg(pos_tokens: List[str]) -> List[str]:
+        out = list(pos_tokens)
+        if out and all_rel:
+            j = rng.randrange(len(out))
+            old = out[j]
+            repl = rng.choice(all_rel)
+            if len(all_rel) > 1 and repl == old:
+                repl = all_rel[(all_rel.index(repl) + 1) % len(all_rel)]
+            out[j] = repl
+        return out
+
+    samples = []
+    for row in pool_rows:
+        q_tokens = row.get("query_tokens", [])
+        pos_tokens = row.get("gold_path") or row.get("oracle_path") or []
+        if not isinstance(q_tokens, list) or not isinstance(pos_tokens, list) or not pos_tokens:
+            continue
+        q = query_vocab.encode(q_tokens, add_bos_eos=False, max_len=max_query_len)
+        pos = path_vocab.encode(pos_tokens, add_bos_eos=False, max_len=max_path_len)
+        if not q or not pos:
+            continue
+
+        raw_cands = row.get("candidates")
+        if not isinstance(raw_cands, list):
+            raw_cands = row.get("neg_candidates")
+        if not isinstance(raw_cands, list):
+            raw_cands = row.get("candidate_pool_top")
+
+        neg_paths: List[List[int]] = []
+        seen = set()
+        for item in (raw_cands or []):
+            cand = item
+            if isinstance(item, dict):
+                cand = item.get("path")
+            if not isinstance(cand, list) or not cand:
+                continue
+            if cand == pos_tokens:
+                continue
+            enc = path_vocab.encode(cand, add_bos_eos=False, max_len=max_path_len)
+            if not enc:
+                continue
+            key = tuple(enc)
+            if key in seen:
+                continue
+            seen.add(key)
+            neg_paths.append(enc)
+            if len(neg_paths) >= num_negatives:
+                break
+
+        tries = 0
+        max_tries = max(20, num_negatives * 8)
+        while len(neg_paths) < num_negatives and tries < max_tries:
+            tries += 1
+            neg_tokens = _mutate_neg(pos_tokens)
+            if neg_tokens == pos_tokens:
+                continue
+            enc = path_vocab.encode(neg_tokens, add_bos_eos=False, max_len=max_path_len)
+            if not enc:
+                continue
+            key = tuple(enc)
+            if key in seen:
+                continue
+            seen.add(key)
+            neg_paths.append(enc)
+
         if not neg_paths:
             continue
         if len(neg_paths) > num_negatives:
@@ -247,8 +406,10 @@ def main() -> None:
     path_vocab = load_vocab(planner_ckpt["path_vocab"])
     query_vocab = load_vocab(planner_ckpt["query_vocab"])
     training_mode = str(cfg.get("training_mode", "bce")).lower()
-    if training_mode not in {"bce", "pairwise", "infonce"}:
-        raise ValueError(f"Unsupported training_mode={training_mode}. Expected bce|pairwise|infonce.")
+    if training_mode not in {"bce", "pairwise", "infonce", "full_pool_listwise"}:
+        raise ValueError(
+            f"Unsupported training_mode={training_mode}. Expected bce|pairwise|infonce|full_pool_listwise."
+        )
 
     if training_mode == "bce":
         dataset = ValueDataset(
@@ -294,6 +455,8 @@ def main() -> None:
                 seed=int(cfg.get("seed", 42)),
                 hard_negatives_by_query=hard_negatives_by_query,
                 near_miss_repeat=int(cfg.get("hard_neg_nearmiss_repeat", 2)),
+                prefix_neg_per_pos=int(cfg.get("prefix_neg_per_pos", 0)),
+                prefix_neg_repeat=int(cfg.get("prefix_neg_repeat", 1)),
             )
             loader = DataLoader(
                 dataset,
@@ -301,7 +464,7 @@ def main() -> None:
                 shuffle=True,
                 collate_fn=lambda b: _collate_pairwise(b, query_vocab.stoi[PAD], path_vocab.stoi[PAD]),
             )
-        else:
+        elif training_mode == "infonce":
             dataset = _build_listwise_samples(
                 rows=rows,
                 path_vocab=path_vocab,
@@ -313,12 +476,38 @@ def main() -> None:
                 num_negatives=int(cfg.get("infonce_num_negatives", 8)),
                 hard_negatives_by_query=hard_negatives_by_query,
                 near_miss_repeat=int(cfg.get("hard_neg_nearmiss_repeat", 2)),
+                prefix_neg_per_pos=int(cfg.get("prefix_neg_per_pos", 0)),
+                prefix_neg_repeat=int(cfg.get("prefix_neg_repeat", 1)),
             )
             loader = DataLoader(
                 dataset,
                 batch_size=int(cfg.get("batch_size", 128)),
                 shuffle=True,
                 collate_fn=lambda b: _collate_listwise(b, query_vocab.stoi[PAD], path_vocab.stoi[PAD]),
+            )
+        else:
+            full_pool_path = str(cfg.get("full_pool_candidates_path", "")).strip()
+            if not full_pool_path:
+                raise ValueError("training_mode=full_pool_listwise requires full_pool_candidates_path in config.")
+            pool_rows = load_jsonl(full_pool_path)
+            dataset = _build_full_pool_listwise_samples(
+                pool_rows=pool_rows,
+                path_vocab=path_vocab,
+                query_vocab=query_vocab,
+                max_path_len=int(cfg.get("max_path_len", 8)),
+                max_query_len=int(cfg.get("max_query_len", 24)),
+                num_negatives=int(cfg.get("full_pool_num_negatives", 31)),
+                seed=int(cfg.get("seed", 42)),
+            )
+            loader = DataLoader(
+                dataset,
+                batch_size=int(cfg.get("batch_size", 128)),
+                shuffle=True,
+                collate_fn=lambda b: _collate_listwise(b, query_vocab.stoi[PAD], path_vocab.stoi[PAD]),
+            )
+            print(
+                f"[value] full_pool_listwise enabled, pool_rows={len(pool_rows)}, "
+                f"samples={len(dataset)}, negatives_per_sample={int(cfg.get('full_pool_num_negatives', 31))}"
             )
         n_samples = len(dataset)
 
@@ -329,6 +518,9 @@ def main() -> None:
         emb_dim=int(cfg.get("emb_dim", 128)),
         q_pad_id=query_vocab.stoi[PAD],
         p_pad_id=path_vocab.stoi[PAD],
+        architecture=str(cfg.get("value_architecture", "legacy")),
+        hidden_dim=int(cfg.get("value_hidden_dim", 256)),
+        dropout=float(cfg.get("value_dropout", 0.1)),
     ).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=float(cfg.get("lr", 3e-4)))
 
@@ -405,6 +597,9 @@ def main() -> None:
             "emb_dim": int(cfg.get("emb_dim", 128)),
             "q_pad_id": query_vocab.stoi[PAD],
             "p_pad_id": path_vocab.stoi[PAD],
+            "architecture": str(cfg.get("value_architecture", "legacy")),
+            "hidden_dim": int(cfg.get("value_hidden_dim", 256)),
+            "dropout": float(cfg.get("value_dropout", 0.1)),
             "training_mode": training_mode,
             "ranking_margin": ranking_margin,
             "infonce_temperature": infonce_temperature,
