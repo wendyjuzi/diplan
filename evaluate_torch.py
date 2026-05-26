@@ -117,6 +117,82 @@ def _is_feasible(path: List[str], constraints: Dict) -> Tuple[bool, List[str]]:
     for rel in path:
         if rel in banned:
             violations.append("banned_relation")
+
+    def _action_stage(token: str) -> str:
+        if not isinstance(token, str):
+            return ""
+        if "::" in token:
+            return token.split("::", 1)[0].strip().upper()
+        if "(" in token:
+            return token.split("(", 1)[0].strip().upper()
+        if "_" in token:
+            return token.split("_", 1)[0].strip().upper()
+        return token.strip().upper()
+
+    def _matches(token: str, pattern: str) -> bool:
+        t = str(token).strip().upper()
+        p = str(pattern).strip().upper()
+        if not p:
+            return False
+        return t == p or t.startswith(p) or _action_stage(t) == p
+
+    # Generic forbidden action constraints (supports exact/prefix/stage-level patterns).
+    forbidden_actions = constraints.get("forbidden_actions", [])
+    if isinstance(forbidden_actions, list):
+        for a in path:
+            for ptn in forbidden_actions:
+                if _matches(a, str(ptn)):
+                    violations.append("forbidden_action")
+                    break
+
+    # Stage order constraints for long-horizon tasks (e.g., clinical workflow).
+    required_stage_order = constraints.get("required_stage_order", [])
+    if isinstance(required_stage_order, list) and required_stage_order:
+        order_idx = {str(s).strip().upper(): i for i, s in enumerate(required_stage_order)}
+        last = -1
+        for a in path:
+            st = _action_stage(a)
+            if st in order_idx:
+                cur = order_idx[st]
+                if cur < last:
+                    violations.append("stage_order_violation")
+                    break
+                last = cur
+
+    # Pairwise precedence constraints: first must happen before second (if second appears).
+    must_precede = constraints.get("must_precede", [])
+    if isinstance(must_precede, list):
+        for rule in must_precede:
+            if not isinstance(rule, dict):
+                continue
+            first = str(rule.get("first", "")).strip()
+            second = str(rule.get("second", "")).strip()
+            if not first or not second:
+                continue
+            first_pos = [i for i, a in enumerate(path) if _matches(a, first)]
+            second_pos = [i for i, a in enumerate(path) if _matches(a, second)]
+            if second_pos:
+                if (not first_pos) or (min(second_pos) < min(first_pos)):
+                    violations.append("precedence_violation")
+                    break
+
+    # For a target action, prerequisite actions must already exist before it.
+    required_before = constraints.get("required_before", {})
+    if isinstance(required_before, dict):
+        for tgt, prereqs in required_before.items():
+            if not isinstance(prereqs, list):
+                continue
+            tgt_pos = [i for i, a in enumerate(path) if _matches(a, str(tgt))]
+            if not tgt_pos:
+                continue
+            first_tgt = min(tgt_pos)
+            for pre in prereqs:
+                pre_pos = [i for i, a in enumerate(path) if _matches(a, str(pre))]
+                if (not pre_pos) or (min(pre_pos) > first_tgt):
+                    violations.append("prerequisite_missing")
+                    break
+            if "prerequisite_missing" in violations:
+                break
     return len(violations) == 0, sorted(set(violations))
 
 
@@ -381,6 +457,7 @@ def _predict_diplan(
     prefix_step_penalty_alpha: float,
     prefix_step_penalty_gamma: float,
     save_candidate_pool_topk: int,
+    save_episode_trace: bool,
 ) -> Dict:
     max_steps = int(row["constraints"].get("max_steps", 8))
     query_tokens = row["query_tokens"]
@@ -388,6 +465,7 @@ def _predict_diplan(
     pool_seen = set()
     all_violations: List[str] = []
     candidate_debug: List[Dict] = []
+    episode_trace: List[Dict] = []
     executed: List[str] = []
     last_plan: List[str] = []
     if not receding_horizon:
@@ -446,9 +524,9 @@ def _predict_diplan(
         all_candidates.extend(cands)
         idx_sorted = sorted(range(len(cands)), key=lambda i: scores[i], reverse=True)
         best = idx_sorted[0]
+        stage2_scores: Dict[int, float] = {i: scores[i] for i in range(len(cands))}
         if rerank_stage1_topk > 0:
             topk = idx_sorted[: min(rerank_stage1_topk, len(idx_sorted))]
-            stage2_scores: Dict[int, float] = {}
             for i in topk:
                 key = tuple(cands[i])
                 consensus = generated_counts.get(key, 0) / max(1, len(generated_all))
@@ -483,7 +561,25 @@ def _predict_diplan(
         feasible, violations = _is_feasible(last_plan, row["constraints"])
         all_violations.extend(violations)
         executed = last_plan if feasible else last_plan[:max_steps]
-        return {
+        if save_episode_trace:
+            episode_trace.append(
+                {
+                    "step": 1,
+                    "remaining_query_tokens": list(query_tokens),
+                    "candidate_count": len(cands),
+                    "candidate_unique_ratio": uniq,
+                    "selected_path": list(last_plan),
+                    "selected_score": float(stage2_scores.get(best, scores[best])) if cands else 0.0,
+                    "selected_stage1_score": float(scores[best]) if cands else 0.0,
+                    "top_stage1_path": list(cands[idx_sorted[0]]) if idx_sorted else [],
+                    "top_stage1_score": float(scores[idx_sorted[0]]) if idx_sorted else 0.0,
+                    "feasible_prefix": bool(feasible),
+                    "feedback_rejections_before_acceptance": 0,
+                    "violations": list(violations),
+                    "replanned": False,
+                }
+            )
+        out = {
             "planned_path": last_plan,
             "executed_path": executed,
             "candidate_count": len(cands),
@@ -494,6 +590,10 @@ def _predict_diplan(
             "candidate_pool_size": len(pool_seen),
             "candidate_pool_top": candidate_debug,
         }
+        if save_episode_trace:
+            out["episode_trace"] = episode_trace
+            out["episode_trace_len"] = len(episode_trace)
+        return out
 
     uniq_vals = []
     for _step in range(max_steps):
@@ -554,9 +654,9 @@ def _predict_diplan(
         all_candidates.extend(cands)
         uniq_vals.append(uniq)
         idx_sorted = sorted(range(len(cands)), key=lambda i: scores[i], reverse=True)
+        stage2_scores: Dict[int, float] = {i: scores[i] for i in range(len(cands))}
         if rerank_stage1_topk > 0:
             topk = idx_sorted[: min(rerank_stage1_topk, len(idx_sorted))]
-            stage2_scores: Dict[int, float] = {}
             for i in topk:
                 key = tuple(cands[i])
                 consensus = generated_counts.get(key, 0) / max(1, len(generated_all))
@@ -588,19 +688,43 @@ def _predict_diplan(
                     }
                 )
         picked = None
+        selected_idx = -1
+        selected_violations: List[str] = []
+        rejected_before_accept = 0
         for i in idx_sorted:
             feasible, violations = _is_feasible(executed + cands[i][:1], row["constraints"])
             if feasible and cands[i]:
+                selected_idx = i
+                selected_violations = list(violations)
                 picked = cands[i]
                 break
             all_violations.extend(violations)
+            rejected_before_accept += 1
         if picked is None:
             break
         last_plan = picked
         executed.append(picked[0])
+        if save_episode_trace:
+            episode_trace.append(
+                {
+                    "step": len(executed),
+                    "remaining_query_tokens": list(rem_q),
+                    "candidate_count": len(cands),
+                    "candidate_unique_ratio": uniq,
+                    "selected_path": list(picked),
+                    "selected_score": float(stage2_scores.get(selected_idx, scores[selected_idx])) if selected_idx >= 0 else 0.0,
+                    "selected_stage1_score": float(scores[selected_idx]) if selected_idx >= 0 else 0.0,
+                    "top_stage1_path": list(cands[idx_sorted[0]]) if idx_sorted else [],
+                    "top_stage1_score": float(scores[idx_sorted[0]]) if idx_sorted else 0.0,
+                    "feasible_prefix": True,
+                    "prefix_violations": selected_violations,
+                    "feedback_rejections_before_acceptance": rejected_before_accept,
+                    "replanned": True,
+                }
+            )
         if len(executed) >= len(row["oracle_path"]):
             break
-    return {
+    out = {
         "planned_path": last_plan if last_plan else executed,
         "executed_path": executed,
         "candidate_count": len(all_candidates),
@@ -611,6 +735,10 @@ def _predict_diplan(
         "candidate_pool_size": len(pool_seen),
         "candidate_pool_top": candidate_debug,
     }
+    if save_episode_trace:
+        out["episode_trace"] = episode_trace
+        out["episode_trace_len"] = len(episode_trace)
+    return out
 
 
 def main() -> None:
@@ -618,7 +746,7 @@ def main() -> None:
     parser.add_argument("--config", type=str, default="configs/eval_torch_kgqa.yaml")
     parser.add_argument("--ae_ckpt", type=str, required=True)
     parser.add_argument("--planner_ckpt", type=str, required=True)
-    parser.add_argument("--value_ckpt", type=str, required=True)
+    parser.add_argument("--value_ckpt", type=str, default="")
     parser.add_argument("--out", type=str, default="results/main_torch")
     args = parser.parse_args()
 
@@ -628,6 +756,15 @@ def main() -> None:
     if include_datasets:
         rows = [r for r in rows if str(r.get("dataset", "")).lower() in set(include_datasets)]
         print(f"[eval] include_datasets={include_datasets} kept={len(rows)}")
+    include_task_names = [str(x).lower() for x in cfg.get("include_task_names", [])]
+    if include_task_names:
+        rows = [
+            r
+            for r in rows
+            if str(r.get("meta", {}).get("task_name", "")).lower() in set(include_task_names)
+            or str(r.get("task_id", "")).lower() in set(include_task_names)
+        ]
+        print(f"[eval] include_task_names={include_task_names} kept={len(rows)}")
     seed = int(cfg.get("seed", 42))
     torch.manual_seed(seed)
 
@@ -636,7 +773,11 @@ def main() -> None:
     ae_ckpt = torch.load(args.ae_ckpt, map_location="cpu")
     planner_ckpt = torch.load(args.planner_ckpt, map_location="cpu")
     use_value_model = bool(cfg.get("use_value_model", True))
-    value_ckpt = torch.load(args.value_ckpt, map_location="cpu") if use_value_model else None
+    value_ckpt = None
+    if use_value_model:
+        if not args.value_ckpt:
+            raise ValueError("use_value_model=true requires --value_ckpt")
+        value_ckpt = torch.load(args.value_ckpt, map_location="cpu")
 
     path_vocab = load_vocab(ae_ckpt["path_vocab"])
     query_vocab = load_vocab(planner_ckpt["query_vocab"])
@@ -752,6 +893,7 @@ def main() -> None:
     prefix_step_penalty_alpha = float(cfg.get("prefix_step_penalty_alpha", 0.0))
     prefix_step_penalty_gamma = float(cfg.get("prefix_step_penalty_gamma", 0.85))
     save_candidate_pool_topk = int(cfg.get("save_candidate_pool_topk", 0))
+    save_episode_trace = bool(cfg.get("save_episode_trace", False))
     adaptive_prefix_alpha_enabled = bool(cfg.get("adaptive_prefix_alpha_enabled", False))
     if adaptive_prefix_alpha_enabled:
         print(
@@ -810,6 +952,7 @@ def main() -> None:
             prefix_step_penalty_alpha=row_prefix_alpha,
             prefix_step_penalty_gamma=prefix_step_penalty_gamma,
             save_candidate_pool_topk=save_candidate_pool_topk,
+            save_episode_trace=save_episode_trace,
         )
         executed = pred["executed_path"]
         feasible, violations = _is_feasible(executed, row["constraints"])
@@ -835,6 +978,7 @@ def main() -> None:
             "latency_cost": pred["candidate_count"] * 0.02,
             "diversity_coverage": pred["candidate_unique_ratio"],
             "replanning_steps": pred["replanning_steps"],
+            "episode_trace_len": int(pred.get("episode_trace_len", 0)),
             "oracle_in_candidate_pool": oracle_in_candidate_pool,
             "candidate_pool_size": int(pred.get("candidate_pool_size", 0)),
             "ranking_error": bool((not success) and oracle_in_candidate_pool),
@@ -843,6 +987,8 @@ def main() -> None:
         }
         if save_candidate_pool_topk > 0:
             rec["candidate_pool_top"] = pred.get("candidate_pool_top", [])
+        if save_episode_trace:
+            rec["episode_trace"] = pred.get("episode_trace", [])
         records.append(rec)
 
     summary = {method: aggregate_method_metrics(records)}

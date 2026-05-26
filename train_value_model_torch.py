@@ -89,6 +89,11 @@ def _build_pairwise_samples(
     near_miss_repeat: int = 2,
     prefix_neg_per_pos: int = 0,
     prefix_neg_repeat: int = 1,
+    add_terminal_truncation_negatives: bool = False,
+    terminal_neg_repeat: int = 1,
+    terminal_stage_prefix: str = "FOLLOWUP::",
+    terminal_margin_gamma: float = 0.3,
+    default_margin: float = 0.2,
 ):
     rng = random.Random(seed)
     all_rel = sorted(list({r for row in rows for r in row.get("oracle_path", []) if isinstance(r, str)}))
@@ -111,6 +116,14 @@ def _build_pairwise_samples(
         return out
 
     samples = []
+
+    def _terminal_truncation_neg(pos_tokens: List[str]) -> List[str]:
+        if len(pos_tokens) < 2:
+            return []
+        tail = pos_tokens[-1]
+        if isinstance(tail, str) and tail.startswith(terminal_stage_prefix):
+            return list(pos_tokens[:-1])
+        return []
     for row in rows:
         q = query_vocab.encode(row.get("query_tokens", []), add_bos_eos=False, max_len=max_query_len)
         pos_tokens = row.get("oracle_path", [])
@@ -129,14 +142,14 @@ def _build_pairwise_samples(
             neg = path_vocab.encode(neg_tokens, add_bos_eos=False, max_len=max_path_len)
             if not neg:
                 neg = [path_vocab.stoi[PAD]]
-            samples.append((q, pos, neg))
+            samples.append((q, pos, neg, float(default_margin)))
         # Process-supervision style negatives: correct prefix, wrong continuation.
         for neg_tokens in _prefix_nearmiss(pos_tokens, prefix_neg_per_pos):
             neg = path_vocab.encode(neg_tokens, add_bos_eos=False, max_len=max_path_len)
             if not neg:
                 continue
             for _ in range(max(1, prefix_neg_repeat)):
-                samples.append((q, pos, neg))
+                samples.append((q, pos, neg, float(default_margin)))
         if hard_negatives_by_query:
             hard_paths = hard_negatives_by_query.get(_query_key(row.get("query_tokens", [])), [])
             oracle_first = pos_tokens[0] if pos_tokens else None
@@ -148,7 +161,14 @@ def _build_pairwise_samples(
                 if oracle_first is not None and hp and hp[0] == oracle_first:
                     rep = max(1, near_miss_repeat)
                 for _ in range(rep):
-                    samples.append((q, pos, neg))
+                    samples.append((q, pos, neg, float(default_margin)))
+        if add_terminal_truncation_negatives:
+            tneg_tokens = _terminal_truncation_neg(pos_tokens)
+            if tneg_tokens:
+                tneg = path_vocab.encode(tneg_tokens, add_bos_eos=False, max_len=max_path_len)
+                if tneg:
+                    for _ in range(max(1, terminal_neg_repeat)):
+                        samples.append((q, pos, tneg, float(terminal_margin_gamma)))
     return samples
 
 
@@ -156,10 +176,11 @@ def _collate_pairwise(batch, q_pad: int, p_pad: int):
     q = [x[0] for x in batch]
     pos = [x[1] for x in batch]
     neg = [x[2] for x in batch]
+    margins = torch.tensor([float(x[3]) for x in batch], dtype=torch.float32)
     q_ids, _ = pad_2d(q, q_pad)
     pos_ids, _ = pad_2d(pos, p_pad)
     neg_ids, _ = pad_2d(neg, p_pad)
-    return q_ids, pos_ids, neg_ids
+    return q_ids, pos_ids, neg_ids, margins
 
 
 def _build_listwise_samples(
@@ -175,6 +196,9 @@ def _build_listwise_samples(
     near_miss_repeat: int = 2,
     prefix_neg_per_pos: int = 0,
     prefix_neg_repeat: int = 1,
+    add_terminal_truncation_negatives: bool = False,
+    terminal_neg_repeat: int = 1,
+    terminal_stage_prefix: str = "FOLLOWUP::",
 ):
     rng = random.Random(seed)
     all_rel = sorted(list({r for row in rows for r in row.get("oracle_path", []) if isinstance(r, str)}))
@@ -208,6 +232,14 @@ def _build_listwise_samples(
                 out.append(neg[: len(pos_tokens)])
         return out
 
+    def _terminal_truncation_neg(pos_tokens: List[str]) -> List[str]:
+        if len(pos_tokens) < 2:
+            return []
+        tail = pos_tokens[-1]
+        if isinstance(tail, str) and tail.startswith(terminal_stage_prefix):
+            return list(pos_tokens[:-1])
+        return []
+
     for row in rows:
         q_tokens = row.get("query_tokens", [])
         pos_tokens = row.get("oracle_path", [])
@@ -216,7 +248,19 @@ def _build_listwise_samples(
         if not q or not pos:
             continue
         neg_paths: List[List[int]] = []
+        terminal_flags: List[bool] = []
         seen = set()
+        if add_terminal_truncation_negatives:
+            tneg_tokens = _terminal_truncation_neg(pos_tokens)
+            if tneg_tokens:
+                tenc = path_vocab.encode(tneg_tokens, add_bos_eos=False, max_len=max_path_len)
+                if tenc:
+                    tkey = tuple(tenc)
+                    if tkey not in seen:
+                        seen.add(tkey)
+                        for _ in range(max(1, terminal_neg_repeat)):
+                            neg_paths.append(tenc)
+                            terminal_flags.append(True)
         oracle_first = pos_tokens[0] if pos_tokens else None
         # Add process-supervision style prefix negatives first.
         for neg_tokens in _prefix_nearmiss(pos_tokens, prefix_neg_per_pos):
@@ -229,6 +273,7 @@ def _build_listwise_samples(
             seen.add(key)
             for _ in range(max(1, prefix_neg_repeat)):
                 neg_paths.append(enc)
+                terminal_flags.append(False)
                 if len(neg_paths) >= num_negatives:
                     break
             if len(neg_paths) >= num_negatives:
@@ -248,6 +293,7 @@ def _build_listwise_samples(
                     rep = max(1, near_miss_repeat)
                 for _ in range(rep):
                     neg_paths.append(enc)
+                    terminal_flags.append(False)
                     if len(neg_paths) >= num_negatives:
                         break
                 if len(neg_paths) >= num_negatives:
@@ -265,11 +311,15 @@ def _build_listwise_samples(
                 continue
             seen.add(key)
             neg_paths.append(enc)
+            terminal_flags.append(False)
         if not neg_paths:
             continue
         if len(neg_paths) > num_negatives:
             neg_paths = neg_paths[:num_negatives]
-        samples.append((q, pos, neg_paths))
+            terminal_flags = terminal_flags[:num_negatives]
+        if len(terminal_flags) < len(neg_paths):
+            terminal_flags.extend([False] * (len(neg_paths) - len(terminal_flags)))
+        samples.append((q, pos, neg_paths, terminal_flags))
     return samples
 
 
@@ -281,6 +331,9 @@ def _build_full_pool_listwise_samples(
     max_query_len: int,
     num_negatives: int,
     seed: int,
+    add_terminal_truncation_negatives: bool = False,
+    terminal_neg_repeat: int = 1,
+    terminal_stage_prefix: str = "FOLLOWUP::",
 ):
     rng = random.Random(seed)
     all_rel = sorted(
@@ -328,6 +381,17 @@ def _build_full_pool_listwise_samples(
 
         neg_paths: List[List[int]] = []
         seen = set()
+        if add_terminal_truncation_negatives and len(pos_tokens) >= 2:
+            tail = pos_tokens[-1]
+            if isinstance(tail, str) and tail.startswith(terminal_stage_prefix):
+                t_tokens = list(pos_tokens[:-1])
+                t_enc = path_vocab.encode(t_tokens, add_bos_eos=False, max_len=max_path_len)
+                if t_enc:
+                    key = tuple(t_enc)
+                    if key not in seen:
+                        seen.add(key)
+                        for _ in range(max(1, terminal_neg_repeat)):
+                            neg_paths.append(t_enc)
         for item in (raw_cands or []):
             cand = item
             if isinstance(item, dict):
@@ -375,21 +439,25 @@ def _collate_listwise(batch, q_pad: int, p_pad: int):
     q = [x[0] for x in batch]
     pos = [x[1] for x in batch]
     neg_lists = [x[2] for x in batch]
+    terminal_flags = [x[3] if len(x) > 3 else [False] * len(x[2]) for x in batch]
     q_ids, _ = pad_2d(q, q_pad)
     pos_ids, _ = pad_2d(pos, p_pad)
     max_k = max(len(x) for x in neg_lists) if neg_lists else 1
     flat_neg = []
     neg_mask = torch.zeros((len(batch), max_k), dtype=torch.bool)
+    terminal_mask = torch.zeros((len(batch), max_k), dtype=torch.bool)
     for i, nlist in enumerate(neg_lists):
         for j in range(max_k):
             if j < len(nlist):
                 flat_neg.append(nlist[j])
                 neg_mask[i, j] = True
+                if j < len(terminal_flags[i]) and bool(terminal_flags[i][j]):
+                    terminal_mask[i, j] = True
             else:
                 flat_neg.append([p_pad])
     neg_ids_flat, _ = pad_2d(flat_neg, p_pad)
     neg_ids = neg_ids_flat.view(len(batch), max_k, -1)
-    return q_ids, pos_ids, neg_ids, neg_mask
+    return q_ids, pos_ids, neg_ids, neg_mask, terminal_mask
 
 
 def main() -> None:
@@ -429,6 +497,11 @@ def main() -> None:
         )
         n_samples = len(dataset)
     else:
+        terminal_margin_weight = float(cfg.get("terminal_margin_weight", 1.0))
+        terminal_margin_gamma = float(cfg.get("terminal_margin_gamma", 0.3))
+        add_terminal_truncation_negatives = bool(cfg.get("add_terminal_truncation_negatives", False))
+        terminal_neg_repeat = int(cfg.get("terminal_neg_repeat", 1))
+        terminal_stage_prefix = str(cfg.get("terminal_stage_prefix", "FOLLOWUP::"))
         hard_negatives_by_query = None
         hard_neg_path = str(cfg.get("hard_negative_predictions_path", "")).strip()
         if hard_neg_path:
@@ -457,6 +530,11 @@ def main() -> None:
                 near_miss_repeat=int(cfg.get("hard_neg_nearmiss_repeat", 2)),
                 prefix_neg_per_pos=int(cfg.get("prefix_neg_per_pos", 0)),
                 prefix_neg_repeat=int(cfg.get("prefix_neg_repeat", 1)),
+                add_terminal_truncation_negatives=add_terminal_truncation_negatives,
+                terminal_neg_repeat=terminal_neg_repeat,
+                terminal_stage_prefix=terminal_stage_prefix,
+                terminal_margin_gamma=terminal_margin_gamma,
+                default_margin=ranking_margin,
             )
             loader = DataLoader(
                 dataset,
@@ -478,6 +556,9 @@ def main() -> None:
                 near_miss_repeat=int(cfg.get("hard_neg_nearmiss_repeat", 2)),
                 prefix_neg_per_pos=int(cfg.get("prefix_neg_per_pos", 0)),
                 prefix_neg_repeat=int(cfg.get("prefix_neg_repeat", 1)),
+                add_terminal_truncation_negatives=add_terminal_truncation_negatives,
+                terminal_neg_repeat=terminal_neg_repeat,
+                terminal_stage_prefix=terminal_stage_prefix,
             )
             loader = DataLoader(
                 dataset,
@@ -498,6 +579,9 @@ def main() -> None:
                 max_query_len=int(cfg.get("max_query_len", 24)),
                 num_negatives=int(cfg.get("full_pool_num_negatives", 31)),
                 seed=int(cfg.get("seed", 42)),
+                add_terminal_truncation_negatives=add_terminal_truncation_negatives,
+                terminal_neg_repeat=terminal_neg_repeat,
+                terminal_stage_prefix=terminal_stage_prefix,
             )
             loader = DataLoader(
                 dataset,
@@ -545,21 +629,22 @@ def main() -> None:
                 gap = torch.tensor(0.0, device=device)
             else:
                 if training_mode == "pairwise":
-                    q_ids, pos_ids, neg_ids = batch
+                    q_ids, pos_ids, neg_ids, margins = batch
                     q_ids = q_ids.to(device)
                     pos_ids = pos_ids.to(device)
                     neg_ids = neg_ids.to(device)
+                    margins = margins.to(device)
                     s_pos = model(q_ids, pos_ids)
                     s_neg = model(q_ids, neg_ids)
-                    target = torch.ones_like(s_pos)
-                    loss = F.margin_ranking_loss(s_pos, s_neg, target, margin=ranking_margin)
+                    loss = torch.relu(margins - (s_pos - s_neg)).mean()
                     gap = (s_pos - s_neg).mean()
                 else:
-                    q_ids, pos_ids, neg_ids, neg_mask = batch
+                    q_ids, pos_ids, neg_ids, neg_mask, terminal_mask = batch
                     q_ids = q_ids.to(device)
                     pos_ids = pos_ids.to(device)
                     neg_ids = neg_ids.to(device)
                     neg_mask = neg_mask.to(device)
+                    terminal_mask = terminal_mask.to(device)
                     s_pos = model(q_ids, pos_ids)  # [B]
                     bsz, k, plen = neg_ids.shape
                     q_rep = q_ids.unsqueeze(1).expand(-1, k, -1).reshape(bsz * k, -1)
@@ -569,6 +654,11 @@ def main() -> None:
                     logits = torch.cat([s_pos.unsqueeze(1), s_neg], dim=1) / max(1e-6, infonce_temperature)
                     target = torch.zeros((bsz,), dtype=torch.long, device=device)
                     loss = F.cross_entropy(logits, target)
+                    if terminal_margin_weight > 0.0 and terminal_mask.any():
+                        terminal_neg = s_neg.masked_fill(~terminal_mask, -1e9).max(dim=1).values
+                        has_terminal = terminal_mask.any(dim=1).float()
+                        terminal_hinge = torch.relu(terminal_margin_gamma - (s_pos - terminal_neg)) * has_terminal
+                        loss = loss + terminal_margin_weight * terminal_hinge.mean()
                     hardest_neg = s_neg.max(dim=1).values
                     gap = (s_pos - hardest_neg).mean()
             opt.zero_grad()
@@ -603,6 +693,11 @@ def main() -> None:
             "training_mode": training_mode,
             "ranking_margin": ranking_margin,
             "infonce_temperature": infonce_temperature,
+            "terminal_margin_gamma": float(cfg.get("terminal_margin_gamma", 0.3)),
+            "terminal_margin_weight": float(cfg.get("terminal_margin_weight", 1.0)),
+            "add_terminal_truncation_negatives": bool(cfg.get("add_terminal_truncation_negatives", False)),
+            "terminal_neg_repeat": int(cfg.get("terminal_neg_repeat", 1)),
+            "terminal_stage_prefix": str(cfg.get("terminal_stage_prefix", "FOLLOWUP::")),
         },
         "query_vocab": planner_ckpt["query_vocab"],
         "path_vocab": planner_ckpt["path_vocab"],

@@ -289,7 +289,7 @@ class ValueRanker(nn.Module):
     ) -> None:
         super().__init__()
         self.architecture = str(architecture).lower()
-        if self.architecture not in {"legacy", "cross"}:
+        if self.architecture not in {"legacy", "cross", "cross_terminal"}:
             raise ValueError(f"Unsupported ValueRanker architecture: {architecture}")
         self.q_pad_id = q_pad_id
         self.p_pad_id = p_pad_id
@@ -302,8 +302,19 @@ class ValueRanker(nn.Module):
                 nn.ReLU(),
                 nn.Linear(128, 1),
             )
-        else:
+        elif self.architecture == "cross":
             feat_dim = emb_dim * 6
+            self.mlp = nn.Sequential(
+                nn.Linear(feat_dim, hidden_dim),
+                nn.ReLU(),
+                nn.Dropout(dropout),
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.ReLU(),
+                nn.Dropout(dropout),
+                nn.Linear(hidden_dim, 1),
+            )
+        else:
+            feat_dim = emb_dim * 9 + 2
             self.mlp = nn.Sequential(
                 nn.Linear(feat_dim, hidden_dim),
                 nn.ReLU(),
@@ -319,6 +330,21 @@ class ValueRanker(nn.Module):
         m = (ids != pad_id).float().unsqueeze(-1)
         s = (e * m).sum(dim=1)
         d = m.sum(dim=1).clamp(min=1.0)
+        return s / d
+
+    def _masked_last(self, ids: torch.Tensor, emb: nn.Embedding, pad_id: int) -> torch.Tensor:
+        e = emb(ids)
+        lens = (ids != pad_id).long().sum(dim=1).clamp(min=1) - 1
+        idx = torch.arange(ids.size(0), device=ids.device)
+        return e[idx, lens]
+
+    def _masked_weighted_mean(self, ids: torch.Tensor, emb: nn.Embedding, pad_id: int) -> torch.Tensor:
+        e = emb(ids)
+        mask = (ids != pad_id).float()
+        pos = torch.arange(ids.size(1), device=ids.device, dtype=torch.float32) + 1.0
+        w = mask * pos.unsqueeze(0)
+        s = (e * w.unsqueeze(-1)).sum(dim=1)
+        d = w.sum(dim=1, keepdim=True).clamp(min=1.0)
         return s / d
 
     def _cross_attention_mean(
@@ -358,17 +384,40 @@ class ValueRanker(nn.Module):
         q_e = self.q_emb(q_ids)
         p_e = self.p_emb(p_ids)
         q_ctx_mean, p_ctx_mean = self._cross_attention_mean(q_e, p_e, q_ids, p_ids)
-        x = torch.cat(
-            [
-                q,
-                p,
-                torch.abs(q - p),
-                q * p,
-                q_ctx_mean,
-                p_ctx_mean,
-            ],
-            dim=1,
-        )
+        if self.architecture == "cross":
+            x = torch.cat(
+                [
+                    q,
+                    p,
+                    torch.abs(q - p),
+                    q * p,
+                    q_ctx_mean,
+                    p_ctx_mean,
+                ],
+                dim=1,
+            )
+        else:
+            q_last = self._masked_last(q_ids, self.q_emb, self.q_pad_id)
+            p_last = self._masked_last(p_ids, self.p_emb, self.p_pad_id)
+            p_weighted = self._masked_weighted_mean(p_ids, self.p_emb, self.p_pad_id)
+            q_len = (q_ids != self.q_pad_id).float().sum(dim=1, keepdim=True) / max(1, q_ids.size(1))
+            p_len = (p_ids != self.p_pad_id).float().sum(dim=1, keepdim=True) / max(1, p_ids.size(1))
+            x = torch.cat(
+                [
+                    q,
+                    p,
+                    q_last,
+                    p_last,
+                    torch.abs(q - p),
+                    q * p,
+                    q_ctx_mean,
+                    p_ctx_mean,
+                    p_weighted,
+                    q_len,
+                    p_len,
+                ],
+                dim=1,
+            )
         return self.mlp(x).squeeze(1)
 
 

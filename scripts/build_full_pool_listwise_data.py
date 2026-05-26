@@ -1,7 +1,13 @@
 import argparse
 import random
 from collections import defaultdict
+from pathlib import Path
+import sys
 from typing import Dict, List, Tuple
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 from src.diplan.io_utils import dump_json, dump_jsonl, load_jsonl
 
@@ -93,7 +99,11 @@ def main() -> None:
                 if len(negs) >= max(1, int(args.pool_size) - 1):
                     break
 
-        while len(negs) < max(1, int(args.pool_size) - 1):
+        target_negs = max(1, int(args.pool_size) - 1)
+        tries = 0
+        max_tries = max(200, target_negs * 50)
+        while len(negs) < target_negs and tries < max_tries:
+            tries += 1
             if not rel_bank:
                 break
             cand = _mutate_path(gold, rel_bank, rng)
@@ -105,7 +115,7 @@ def main() -> None:
             seen.add(key)
             negs.append(cand)
 
-        negs = negs[: max(1, int(args.pool_size) - 1)]
+        negs = negs[:target_negs]
         all_cands = [gold] + negs
         out_rows.append(
             {
