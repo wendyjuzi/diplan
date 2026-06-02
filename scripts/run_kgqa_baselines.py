@@ -33,6 +33,7 @@ METRIC_KEYS = [
     "ranking_error_rate",
     "candidate_pool_avg_size",
     "conditional_success_given_pool_hit",
+    "retrieval_fusion_rate",
     "llm_error_rate",
     "llm_fallback_rate",
 ]
@@ -131,6 +132,43 @@ def _baseline_specs(args: argparse.Namespace, base_cfg: Dict) -> List[Dict]:
             "description": "Generate/select without the learned value ranker.",
         },
         {
+            "label": "memory_value_ranker",
+            "runner": "evaluate_torch",
+            "overrides": {
+                "disable_generated_candidates": True,
+                "use_memory_retrieval": True,
+                "memory_prefilter_feasible": True,
+                "use_value_model": True,
+                "rerank_stage1_topk": 0,
+                "rerank_consensus_weight": 0.0,
+                "rerank_prefix_consensus_weight": 0.0,
+                "rerank_memory_bonus": 0.0,
+                "rerank_memory_rank_bonus": 0.0,
+                "rerank_stage2_length_penalty_alpha": 0.0,
+                "value_guided_sampling": False,
+            },
+            "description": "Learned value ranker applied directly to feasible retrieval/memory candidates.",
+        },
+        {
+            "label": "memory_value_ranker_inverted",
+            "runner": "evaluate_torch",
+            "overrides": {
+                "disable_generated_candidates": True,
+                "use_memory_retrieval": True,
+                "memory_prefilter_feasible": True,
+                "use_value_model": True,
+                "value_score_sign": -1.0,
+                "rerank_stage1_topk": 0,
+                "rerank_consensus_weight": 0.0,
+                "rerank_prefix_consensus_weight": 0.0,
+                "rerank_memory_bonus": 0.0,
+                "rerank_memory_rank_bonus": 0.0,
+                "rerank_stage2_length_penalty_alpha": 0.0,
+                "value_guided_sampling": False,
+            },
+            "description": "Same as memory_value_ranker, but treats lower raw value logits as better.",
+        },
+        {
             "label": "no_rerank",
             "runner": "evaluate_torch",
             "overrides": {
@@ -159,6 +197,15 @@ def _baseline_specs(args: argparse.Namespace, base_cfg: Dict) -> List[Dict]:
                 "receding_horizon": True,
             },
             "description": "Limited-commitment execution; replans after each selected action.",
+        },
+        {
+            "label": "diplan_retrieval_fusion",
+            "runner": "evaluate_torch",
+            "overrides": {
+                "retrieval_fusion_enabled": True,
+                "retrieval_fusion_margin": 2.0,
+            },
+            "description": "Learned ranker with a confidence-gated feasible retrieval fallback.",
         },
         {
             "label": "full_plan_once",

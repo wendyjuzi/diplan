@@ -208,6 +208,60 @@ def _is_feasible(path: List[str], constraints: Dict) -> Tuple[bool, List[str]]:
     return len(violations) == 0, sorted(set(violations))
 
 
+def _first_feasible_memory_idx(
+    cands: List[List[str]],
+    memory_candidates: List[List[str]],
+    constraints: Dict,
+    executed_prefix: List[str] | None = None,
+) -> int:
+    key_to_idx = {tuple(c): i for i, c in enumerate(cands)}
+    prefix = executed_prefix or []
+    for mem_path in memory_candidates:
+        idx = key_to_idx.get(tuple(mem_path), -1)
+        if idx < 0:
+            continue
+        if prefix and mem_path[: len(prefix)] != prefix:
+            continue
+        if prefix and len(mem_path) <= len(prefix):
+            continue
+        path_to_check = mem_path if not prefix else prefix + [mem_path[len(prefix)]]
+        feasible, _ = _is_feasible(path_to_check, constraints)
+        if feasible:
+            return idx
+    return -1
+
+
+def _maybe_apply_retrieval_fusion(
+    idx_sorted: List[int],
+    cands: List[List[str]],
+    memory_candidates: List[List[str]],
+    constraints: Dict,
+    stage_scores: Dict[int, float],
+    enabled: bool,
+    margin: float,
+    executed_prefix: List[str] | None = None,
+) -> Tuple[List[int], bool]:
+    if not enabled or not idx_sorted:
+        return idx_sorted, False
+    anchor_idx = _first_feasible_memory_idx(
+        cands=cands,
+        memory_candidates=memory_candidates,
+        constraints=constraints,
+        executed_prefix=executed_prefix,
+    )
+    if anchor_idx < 0:
+        return idx_sorted, False
+    best_idx = idx_sorted[0]
+    if best_idx == anchor_idx:
+        return idx_sorted, False
+    best_score = float(stage_scores.get(best_idx, 0.0))
+    anchor_score = float(stage_scores.get(anchor_idx, 0.0))
+    if best_score >= anchor_score + margin:
+        return idx_sorted, False
+    fused = [anchor_idx] + [i for i in idx_sorted if i != anchor_idx]
+    return fused, True
+
+
 def _save_summary_csv(path: str, summary: Dict[str, Dict]) -> None:
     ensure_dir(str(Path(path).parent))
     base_fields = [
@@ -571,6 +625,7 @@ def _predict_diplan(
     candidate_multi_jitter_stds: List[float],
     expected_total_len: float,
     length_penalty_alpha: float,
+    value_score_sign: float,
     rerank_stage1_topk: int,
     rerank_consensus_weight: float,
     rerank_memory_bonus: float,
@@ -583,6 +638,9 @@ def _predict_diplan(
     value_guidance_scale: float,
     value_guidance_interval: int,
     value_guidance_temperature: float,
+    retrieval_fusion_enabled: bool,
+    retrieval_fusion_margin: float,
+    disable_generated_candidates: bool,
     save_candidate_pool_topk: int,
     save_episode_trace: bool,
 ) -> Dict:
@@ -593,36 +651,38 @@ def _predict_diplan(
     all_violations: List[str] = []
     candidate_debug: List[Dict] = []
     episode_trace: List[Dict] = []
+    retrieval_fusion_used = False
     executed: List[str] = []
     last_plan: List[str] = []
     if not receding_horizon:
-        jitter_list = [candidate_latent_jitter_std] + [x for x in candidate_multi_jitter_stds if x != candidate_latent_jitter_std]
         generated_all: List[List[str]] = []
-        for jit in jitter_list:
-            c_gen, _ = _generate_candidates(
-                planner,
-                autoencoder,
-                value_model,
-                path_vocab,
-                query_vocab,
-                query_tokens,
-                num_candidates,
-                diffusion_steps,
-                max_steps,
-                device,
-                latent_mean=latent_mean,
-                latent_std=latent_std,
-                prediction_target=prediction_target,
-                planner_type=planner_type,
-                candidate_latent_jitter_std=jit,
-                value_guided_sampling=value_guided_sampling,
-                value_guidance_scale=value_guidance_scale,
-                value_guidance_interval=value_guidance_interval,
-                value_guidance_temperature=value_guidance_temperature,
-                expected_len=expected_total_len,
-                length_penalty_alpha=length_penalty_alpha,
-            )
-            generated_all.extend(c_gen)
+        if not disable_generated_candidates:
+            jitter_list = [candidate_latent_jitter_std] + [x for x in candidate_multi_jitter_stds if x != candidate_latent_jitter_std]
+            for jit in jitter_list:
+                c_gen, _ = _generate_candidates(
+                    planner,
+                    autoencoder,
+                    value_model,
+                    path_vocab,
+                    query_vocab,
+                    query_tokens,
+                    num_candidates,
+                    diffusion_steps,
+                    max_steps,
+                    device,
+                    latent_mean=latent_mean,
+                    latent_std=latent_std,
+                    prediction_target=prediction_target,
+                    planner_type=planner_type,
+                    candidate_latent_jitter_std=jit,
+                    value_guided_sampling=value_guided_sampling,
+                    value_guidance_scale=value_guidance_scale,
+                    value_guidance_interval=value_guidance_interval,
+                    value_guidance_temperature=value_guidance_temperature,
+                    expected_len=expected_total_len,
+                    length_penalty_alpha=length_penalty_alpha,
+                )
+                generated_all.extend(c_gen)
         generated_unique, generated_counts = _dedupe_with_count(generated_all)
         cands = _merge_candidates(generated_unique, memory_candidates)
         mem_set = {tuple(x) for x in memory_candidates}
@@ -656,6 +716,8 @@ def _predict_diplan(
         )
         if prefix_step_penalty_alpha > 0.0:
             scores = [s - prefix_step_penalty_alpha * p for s, p in zip(scores, prefix_penalties)]
+        if value_score_sign < 0.0:
+            scores = [-s for s in scores]
         failure_weights = row.get("_failure_bad_first_action_weights", {})
         failure_penalty = float(row.get("_failure_action_penalty", 0.0))
         if failure_penalty > 0.0 and isinstance(failure_weights, dict):
@@ -687,6 +749,18 @@ def _predict_diplan(
                     - len_pen
                 )
             best = max(topk, key=lambda i: stage2_scores.get(i, -1e18))
+        selection_order = sorted(range(len(cands)), key=lambda i: stage2_scores.get(i, scores[i]), reverse=True)
+        selection_order, fusion_used = _maybe_apply_retrieval_fusion(
+            idx_sorted=selection_order,
+            cands=cands,
+            memory_candidates=memory_candidates,
+            constraints=row["constraints"],
+            stage_scores=stage2_scores,
+            enabled=retrieval_fusion_enabled,
+            margin=retrieval_fusion_margin,
+        )
+        retrieval_fusion_used = retrieval_fusion_used or fusion_used
+        best = selection_order[0]
         if save_candidate_pool_topk > 0:
             for i in idx_sorted[: min(save_candidate_pool_topk, len(idx_sorted))]:
                 candidate_debug.append(
@@ -734,6 +808,7 @@ def _predict_diplan(
             "candidate_pool_hit": tuple(row["oracle_path"]) in pool_seen,
             "candidate_pool_size": len(pool_seen),
             "candidate_pool_top": candidate_debug,
+            "retrieval_fusion_used": retrieval_fusion_used,
         }
         if save_episode_trace:
             out["episode_trace"] = episode_trace
@@ -746,33 +821,34 @@ def _predict_diplan(
         # only to the next action of a full candidate plan.
         rem_q = query_tokens
         expected_remaining = expected_total_len
-        jitter_list = [candidate_latent_jitter_std] + [x for x in candidate_multi_jitter_stds if x != candidate_latent_jitter_std]
         generated_all: List[List[str]] = []
-        for jit in jitter_list:
-            c_gen, _ = _generate_candidates(
-                planner,
-                autoencoder,
-                value_model,
-                path_vocab,
-                query_vocab,
-                rem_q,
-                num_candidates,
-                diffusion_steps,
-                max_steps,
-                device,
-                latent_mean=latent_mean,
-                latent_std=latent_std,
-                prediction_target=prediction_target,
-                planner_type=planner_type,
-                candidate_latent_jitter_std=jit,
-                value_guided_sampling=value_guided_sampling,
-                value_guidance_scale=value_guidance_scale,
-                value_guidance_interval=value_guidance_interval,
-                value_guidance_temperature=value_guidance_temperature,
-                expected_len=expected_remaining,
-                length_penalty_alpha=length_penalty_alpha,
-            )
-            generated_all.extend(c_gen)
+        if not disable_generated_candidates:
+            jitter_list = [candidate_latent_jitter_std] + [x for x in candidate_multi_jitter_stds if x != candidate_latent_jitter_std]
+            for jit in jitter_list:
+                c_gen, _ = _generate_candidates(
+                    planner,
+                    autoencoder,
+                    value_model,
+                    path_vocab,
+                    query_vocab,
+                    rem_q,
+                    num_candidates,
+                    diffusion_steps,
+                    max_steps,
+                    device,
+                    latent_mean=latent_mean,
+                    latent_std=latent_std,
+                    prediction_target=prediction_target,
+                    planner_type=planner_type,
+                    candidate_latent_jitter_std=jit,
+                    value_guided_sampling=value_guided_sampling,
+                    value_guidance_scale=value_guidance_scale,
+                    value_guidance_interval=value_guidance_interval,
+                    value_guidance_temperature=value_guidance_temperature,
+                    expected_len=expected_remaining,
+                    length_penalty_alpha=length_penalty_alpha,
+                )
+                generated_all.extend(c_gen)
         generated_unique, generated_counts = _dedupe_with_count(generated_all)
         cands = _merge_candidates(generated_unique, memory_candidates)
         mem_set = {tuple(x) for x in memory_candidates}
@@ -806,6 +882,8 @@ def _predict_diplan(
         )
         if prefix_step_penalty_alpha > 0.0:
             scores = [s - prefix_step_penalty_alpha * p for s, p in zip(scores, prefix_penalties)]
+        if value_score_sign < 0.0:
+            scores = [-s for s in scores]
         failure_weights = row.get("_failure_bad_first_action_weights", {})
         failure_penalty = float(row.get("_failure_action_penalty", 0.0))
         if failure_penalty > 0.0 and isinstance(failure_weights, dict):
@@ -837,6 +915,17 @@ def _predict_diplan(
                     - len_pen
                 )
             idx_sorted = sorted(topk, key=lambda i: stage2_scores.get(i, -1e18), reverse=True)
+        idx_sorted, fusion_used = _maybe_apply_retrieval_fusion(
+            idx_sorted=idx_sorted,
+            cands=cands,
+            memory_candidates=memory_candidates,
+            constraints=row["constraints"],
+            stage_scores=stage2_scores,
+            enabled=retrieval_fusion_enabled,
+            margin=retrieval_fusion_margin,
+            executed_prefix=executed,
+        )
+        retrieval_fusion_used = retrieval_fusion_used or fusion_used
         if save_candidate_pool_topk > 0:
             for i in idx_sorted[: min(save_candidate_pool_topk, len(idx_sorted))]:
                 candidate_debug.append(
@@ -917,6 +1006,7 @@ def _predict_diplan(
         "candidate_pool_hit": tuple(row["oracle_path"]) in pool_seen,
         "candidate_pool_size": len(pool_seen),
         "candidate_pool_top": candidate_debug,
+        "retrieval_fusion_used": retrieval_fusion_used,
     }
     if save_episode_trace:
         out["episode_trace"] = episode_trace
@@ -1068,6 +1158,7 @@ def main() -> None:
     method = "diplan_torch_mem" if use_memory_retrieval else "diplan_torch"
     candidate_latent_jitter_std = float(cfg.get("candidate_latent_jitter_std", 0.0))
     candidate_multi_jitter_stds = [float(x) for x in cfg.get("candidate_multi_jitter_stds", [])]
+    value_score_sign = float(cfg.get("value_score_sign", 1.0))
     if candidate_latent_jitter_std > 0:
         print(f"[eval] candidate_latent_jitter_std={candidate_latent_jitter_std}")
     if candidate_multi_jitter_stds:
@@ -1084,6 +1175,9 @@ def main() -> None:
     value_guidance_scale = float(cfg.get("value_guidance_scale", 0.0))
     value_guidance_interval = int(cfg.get("value_guidance_interval", 4))
     value_guidance_temperature = float(cfg.get("value_guidance_temperature", 0.5))
+    retrieval_fusion_enabled = bool(cfg.get("retrieval_fusion_enabled", False))
+    retrieval_fusion_margin = float(cfg.get("retrieval_fusion_margin", 0.0))
+    disable_generated_candidates = bool(cfg.get("disable_generated_candidates", False))
     save_candidate_pool_topk = int(cfg.get("save_candidate_pool_topk", 0))
     save_episode_trace = bool(cfg.get("save_episode_trace", False))
     emit_structured_plan = bool(cfg.get("emit_structured_plan", False))
@@ -1116,6 +1210,12 @@ def main() -> None:
             print("[eval] value_guided_sampling is only active for diffusion planners; current planner is not diffusion.")
         if value_model is None:
             print("[eval] value_guided_sampling requested but value_model is disabled or missing.")
+    if retrieval_fusion_enabled:
+        print(f"[eval] retrieval_fusion enabled, margin={retrieval_fusion_margin:.3f}")
+    if disable_generated_candidates:
+        print("[eval] generated candidates disabled; ranking memory/retrieval candidates only.")
+    if value_score_sign < 0.0:
+        print("[eval] value_score_sign=-1 enabled; lower raw value logits are treated as better.")
     records = []
     memory_prefilter_dropped = 0
     alpha_bucket_counter: Dict[str, int] = defaultdict(int)
@@ -1167,6 +1267,7 @@ def main() -> None:
                 bucket_expected_len,
             ),
             length_penalty_alpha=length_penalty_alpha,
+            value_score_sign=value_score_sign,
             rerank_stage1_topk=rerank_stage1_topk,
             rerank_consensus_weight=rerank_consensus_weight,
             rerank_memory_bonus=rerank_memory_bonus,
@@ -1179,6 +1280,9 @@ def main() -> None:
             value_guidance_scale=value_guidance_scale,
             value_guidance_interval=value_guidance_interval,
             value_guidance_temperature=value_guidance_temperature,
+            retrieval_fusion_enabled=retrieval_fusion_enabled,
+            retrieval_fusion_margin=retrieval_fusion_margin,
+            disable_generated_candidates=disable_generated_candidates,
             save_candidate_pool_topk=save_candidate_pool_topk,
             save_episode_trace=save_episode_trace,
         )
@@ -1216,6 +1320,7 @@ def main() -> None:
             "oracle_in_candidate_pool": oracle_in_candidate_pool,
             "candidate_pool_size": int(pred.get("candidate_pool_size", 0)),
             "ranking_error": bool((not success) and oracle_in_candidate_pool),
+            "retrieval_fusion_used": bool(pred.get("retrieval_fusion_used", False)),
             "prefix_step_penalty_alpha": float(row_prefix_alpha),
             "prefix_step_penalty_alpha_source": alpha_source,
         }
@@ -1240,6 +1345,8 @@ def main() -> None:
             / max(1, len(records)),
             "ranking_error_rate": sum(1.0 if r["ranking_error"] else 0.0 for r in records) / max(1, len(records)),
             "candidate_pool_avg_size": sum(float(r["candidate_pool_size"]) for r in records) / max(1, len(records)),
+            "retrieval_fusion_rate": sum(1.0 if r.get("retrieval_fusion_used") else 0.0 for r in records)
+            / max(1, len(records)),
             "conditional_success_given_pool_hit": (
                 sum(1.0 if r["success"] else 0.0 for r in records if r["oracle_in_candidate_pool"])
                 / max(1, sum(1 for r in records if r["oracle_in_candidate_pool"]))
@@ -1260,6 +1367,8 @@ def main() -> None:
                 / max(1, len(ds_recs)),
                 "ranking_error_rate": sum(1.0 if r["ranking_error"] else 0.0 for r in ds_recs) / max(1, len(ds_recs)),
                 "candidate_pool_avg_size": sum(float(r["candidate_pool_size"]) for r in ds_recs) / max(1, len(ds_recs)),
+                "retrieval_fusion_rate": sum(1.0 if r.get("retrieval_fusion_used") else 0.0 for r in ds_recs)
+                / max(1, len(ds_recs)),
             }
         )
     dump_json(str(Path(args.out) / "summary_by_dataset.json"), by_dataset)
