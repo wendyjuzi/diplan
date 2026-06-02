@@ -38,6 +38,16 @@ def main() -> None:
     parser.add_argument("--pool_size", type=int, default=32)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--use_planned_and_executed", action="store_true")
+    parser.add_argument(
+        "--require_gold_in_pool",
+        action="store_true",
+        help="Skip rows where the oracle path is not present in the retrieved candidate pool.",
+    )
+    parser.add_argument(
+        "--no_synthetic_negatives",
+        action="store_true",
+        help="Do not fill missing negatives with mutated oracle paths; keep only retrieved hard negatives.",
+    )
     args = parser.parse_args()
 
     rng = random.Random(int(args.seed))
@@ -67,6 +77,7 @@ def main() -> None:
 
         negs: List[List[str]] = []
         seen = set()
+        gold_in_pool = False
 
         pool = r.get("candidate_pool_top", [])
         if isinstance(pool, list):
@@ -75,6 +86,7 @@ def main() -> None:
                 if not isinstance(cand, list) or not cand:
                     continue
                 if cand == gold:
+                    gold_in_pool = True
                     continue
                 key = tuple(cand)
                 if key in seen:
@@ -84,12 +96,17 @@ def main() -> None:
                 if len(negs) >= max(1, int(args.pool_size) - 1):
                     break
 
+        if args.require_gold_in_pool and not gold_in_pool:
+            stats["skipped_gold_not_in_pool"] += 1
+            continue
+
         if args.use_planned_and_executed:
             for key_name in ("planned_path", "executed_path"):
                 cand = r.get(key_name, [])
                 if not isinstance(cand, list) or not cand:
                     continue
                 if cand == gold:
+                    gold_in_pool = True
                     continue
                 key = tuple(cand)
                 if key in seen:
@@ -102,7 +119,7 @@ def main() -> None:
         target_negs = max(1, int(args.pool_size) - 1)
         tries = 0
         max_tries = max(200, target_negs * 50)
-        while len(negs) < target_negs and tries < max_tries:
+        while (not args.no_synthetic_negatives) and len(negs) < target_negs and tries < max_tries:
             tries += 1
             if not rel_bank:
                 break
@@ -126,6 +143,8 @@ def main() -> None:
                 "candidates": all_cands,
                 "neg_candidates": negs,
                 "source_pool_size": len(pool) if isinstance(pool, list) else 0,
+                "gold_in_source_pool": gold_in_pool,
+                "synthetic_negatives_enabled": not bool(args.no_synthetic_negatives),
             }
         )
         stats["rows"] += 1

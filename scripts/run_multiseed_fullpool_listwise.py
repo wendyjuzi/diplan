@@ -112,6 +112,11 @@ def main() -> None:
         default="runs/multiseed_fullpool_listwise_cwq_webqsp",
     )
     parser.add_argument("--bootstrap", type=int, default=5000)
+    parser.add_argument(
+        "--retrieval_pool_aware",
+        action="store_true",
+        help="Train listwise value model only on rows where gold appears in retrieved candidate pools.",
+    )
     args = parser.parse_args()
 
     repo = Path(args.repo_root).resolve()
@@ -197,7 +202,8 @@ def main() -> None:
                 "--seed",
                 str(seed),
                 "--use_planned_and_executed",
-            ],
+            ]
+            + (["--require_gold_in_pool", "--no_synthetic_negatives"] if args.retrieval_pool_aware else []),
             cwd=repo,
         )
 
