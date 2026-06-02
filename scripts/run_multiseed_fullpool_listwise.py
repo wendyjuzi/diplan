@@ -81,6 +81,15 @@ def main() -> None:
         help="Baseline run directory name under baseline_root/seed_x.",
     )
     parser.add_argument(
+        "--baseline_run_template",
+        type=str,
+        default="",
+        help=(
+            "Optional explicit baseline run path template. May contain {seed}. "
+            "Overrides baseline_root/seed_x/baseline_run_name when set."
+        ),
+    )
+    parser.add_argument(
         "--baseline_label",
         type=str,
         default="stage4_cross_infonce",
@@ -266,7 +275,12 @@ def main() -> None:
         )
 
         # 5) Load stage-4 baseline and stage-5 metrics/predictions.
-        stage4_out = repo / args.baseline_root / f"seed_{seed}" / args.baseline_run_name
+        if args.baseline_run_template:
+            stage4_out = Path(args.baseline_run_template.format(seed=seed))
+            if not stage4_out.is_absolute():
+                stage4_out = repo / stage4_out
+        else:
+            stage4_out = repo / args.baseline_root / f"seed_{seed}" / args.baseline_run_name
         if not stage4_out.exists():
             raise FileNotFoundError(f"Missing stage-4 baseline dir: {stage4_out}")
 
