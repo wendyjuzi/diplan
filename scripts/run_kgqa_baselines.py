@@ -174,6 +174,14 @@ def _baseline_specs(args: argparse.Namespace, base_cfg: Dict) -> List[Dict]:
             "overrides": {},
             "description": "Tool/search baseline: token retrieval over train-set paths.",
         },
+        {
+            "label": "retrieval_feasible",
+            "runner": "retrieval_baseline",
+            "overrides": {
+                "retrieval_filter_feasible": True,
+            },
+            "description": "Retrieval baseline with the same feasibility constraints applied before top-1 selection.",
+        },
     ]
     if args.run_llm_agent:
         specs.append(
@@ -239,6 +247,7 @@ def _run_retrieval_baseline(spec: Dict, cfg: Dict, out_dir: Path, cfg_dir: Path,
         "max_postings_per_token": int(cfg.get("memory_max_postings_per_token", 1200)),
         "include_datasets": cfg.get("include_datasets", []),
         "max_tasks": int(cfg.get("max_tasks", 0)),
+        "filter_feasible": bool(cfg.get("retrieval_filter_feasible", False)),
     }
     cfg_path = cfg_dir / f"{spec['label']}.json"
     _write_json(cfg_path, retrieval_cfg)

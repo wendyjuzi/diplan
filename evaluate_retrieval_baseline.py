@@ -127,13 +127,22 @@ def main() -> None:
         max_postings_per_token=int(cfg.get("max_postings_per_token", 1200)),
     )
     top_k = int(cfg.get("top_k", 8))
+    filter_feasible = bool(cfg.get("filter_feasible", False))
     fallback_path = random.choice(path_bank) if path_bank else []
 
-    method = "retrieval_only"
+    method = "retrieval_feasible" if filter_feasible else "retrieval_only"
     records = []
     for row in test_rows:
-        candidates = _retrieve(row.get("query_tokens", []), token_to_ids, path_bank, top_k=top_k)
-        predicted = candidates[0] if candidates else fallback_path
+        raw_candidates = _retrieve(row.get("query_tokens", []), token_to_ids, path_bank, top_k=top_k)
+        candidates = raw_candidates
+        if filter_feasible:
+            candidates = [c for c in raw_candidates if _is_feasible(c, row["constraints"])[0]]
+        if candidates:
+            predicted = candidates[0]
+        elif filter_feasible and not _is_feasible(fallback_path, row["constraints"])[0]:
+            predicted = []
+        else:
+            predicted = fallback_path
         feasible, violations = _is_feasible(predicted, row["constraints"])
         oracle_in_candidate_pool = tuple(row["oracle_path"]) in {tuple(c) for c in candidates}
         success = predicted == row["oracle_path"]
@@ -158,6 +167,8 @@ def main() -> None:
             "diversity_coverage": float(len({tuple(x) for x in candidates}) / max(1, len(candidates) if candidates else 1)),
             "oracle_in_candidate_pool": oracle_in_candidate_pool,
             "candidate_pool_size": len({tuple(x) for x in candidates}),
+            "raw_candidate_pool_size": len({tuple(x) for x in raw_candidates}),
+            "raw_oracle_in_candidate_pool": tuple(row["oracle_path"]) in {tuple(c) for c in raw_candidates},
             "ranking_error": bool((not success) and oracle_in_candidate_pool),
         }
         records.append(rec)

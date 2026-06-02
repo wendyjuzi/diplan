@@ -742,8 +742,10 @@ def _predict_diplan(
 
     uniq_vals = []
     for _step in range(max_steps):
-        rem_q = query_tokens[len(executed) :] if len(executed) < len(query_tokens) else query_tokens
-        expected_remaining = max(1.0, expected_total_len - len(executed))
+        # Receding-horizon planning keeps the original task context and commits
+        # only to the next action of a full candidate plan.
+        rem_q = query_tokens
+        expected_remaining = expected_total_len
         jitter_list = [candidate_latent_jitter_std] + [x for x in candidate_multi_jitter_stds if x != candidate_latent_jitter_std]
         generated_all: List[List[str]] = []
         for jit in jitter_list:
@@ -851,22 +853,39 @@ def _predict_diplan(
                     }
                 )
         picked = None
+        picked_next_action = ""
         selected_idx = -1
         selected_violations: List[str] = []
         rejected_before_accept = 0
-        for i in idx_sorted:
-            feasible, violations = _is_feasible(executed + cands[i][:1], row["constraints"])
-            if feasible and cands[i]:
-                selected_idx = i
-                selected_violations = list(violations)
-                picked = cands[i]
+        prefix_pos = len(executed)
+        selection_passes = (True, False)
+        for require_prefix_match in selection_passes:
+            for i in idx_sorted:
+                cand = cands[i]
+                if not cand:
+                    continue
+                if require_prefix_match and cand[:prefix_pos] != executed:
+                    rejected_before_accept += 1
+                    continue
+                if len(cand) <= prefix_pos:
+                    rejected_before_accept += 1
+                    continue
+                next_action = cand[prefix_pos] if cand[:prefix_pos] == executed else cand[0]
+                feasible, violations = _is_feasible(executed + [next_action], row["constraints"])
+                if feasible:
+                    selected_idx = i
+                    selected_violations = list(violations)
+                    picked = cand
+                    picked_next_action = next_action
+                    break
+                all_violations.extend(violations)
+                rejected_before_accept += 1
+            if picked is not None:
                 break
-            all_violations.extend(violations)
-            rejected_before_accept += 1
         if picked is None:
             break
-        last_plan = picked
-        executed.append(picked[0])
+        last_plan = list(executed) + [picked_next_action]
+        executed.append(picked_next_action)
         if save_episode_trace:
             episode_trace.append(
                 {
@@ -875,6 +894,7 @@ def _predict_diplan(
                     "candidate_count": len(cands),
                     "candidate_unique_ratio": uniq,
                     "selected_path": list(picked),
+                    "selected_next_action": picked_next_action,
                     "selected_score": float(stage2_scores.get(selected_idx, scores[selected_idx])) if selected_idx >= 0 else 0.0,
                     "selected_stage1_score": float(scores[selected_idx]) if selected_idx >= 0 else 0.0,
                     "top_stage1_path": list(cands[idx_sorted[0]]) if idx_sorted else [],
@@ -888,7 +908,7 @@ def _predict_diplan(
         if len(executed) >= len(row["oracle_path"]):
             break
     out = {
-        "planned_path": last_plan if last_plan else executed,
+        "planned_path": executed if executed else (last_plan if last_plan else executed),
         "executed_path": executed,
         "candidate_count": len(all_candidates),
         "candidate_unique_ratio": sum(uniq_vals) / max(1, len(uniq_vals)),
@@ -1166,6 +1186,12 @@ def main() -> None:
         feasible, violations = _is_feasible(executed, row["constraints"])
         oracle_in_candidate_pool = bool(pred.get("candidate_pool_hit", False))
         success = executed == row["oracle_path"]
+        candidate_count = int(pred["candidate_count"])
+        token_cost = (
+            len(executed) + candidate_count
+            if bool(cfg.get("receding_horizon", True))
+            else len(executed) * (1 + candidate_count)
+        )
         rec = {
             "task_id": row["task_id"],
             "dataset": row["dataset"],
@@ -1182,8 +1208,8 @@ def main() -> None:
             "feasible": feasible,
             "violations": sorted(set(violations + pred["violations"])),
             "plan_execution_consistency": plan_execution_consistency(pred["planned_path"], executed),
-            "token_cost": len(executed) * (1 + pred["candidate_count"]),
-            "latency_cost": pred["candidate_count"] * 0.02,
+            "token_cost": token_cost,
+            "latency_cost": candidate_count * 0.02,
             "diversity_coverage": pred["candidate_unique_ratio"],
             "replanning_steps": pred["replanning_steps"],
             "episode_trace_len": int(pred.get("episode_trace_len", 0)),
