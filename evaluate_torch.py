@@ -743,6 +743,7 @@ def _predict_diplan(
     uniq_vals = []
     for _step in range(max_steps):
         rem_q = query_tokens[len(executed) :] if len(executed) < len(query_tokens) else query_tokens
+        expected_remaining = max(1.0, expected_total_len - len(executed))
         jitter_list = [candidate_latent_jitter_std] + [x for x in candidate_multi_jitter_stds if x != candidate_latent_jitter_std]
         generated_all: List[List[str]] = []
         for jit in jitter_list:
@@ -782,7 +783,6 @@ def _predict_diplan(
         for c in cands:
             pool_seen.add(tuple(c))
         uniq = len({tuple(x) for x in generated_all}) / max(1, len(generated_all))
-        expected_remaining = max(1.0, expected_total_len - len(executed))
         scores = _score_candidates(
             value_model,
             path_vocab,
@@ -928,6 +928,10 @@ def main() -> None:
             or str(r.get("task_id", "")).lower() in set(include_task_names)
         ]
         print(f"[eval] include_task_names={include_task_names} kept={len(rows)}")
+    max_tasks = int(cfg.get("max_tasks", 0))
+    if max_tasks > 0:
+        rows = rows[:max_tasks]
+        print(f"[eval] max_tasks={max_tasks} kept={len(rows)}")
     seed = int(cfg.get("seed", 42))
     torch.manual_seed(seed)
 

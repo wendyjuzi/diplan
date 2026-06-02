@@ -32,6 +32,7 @@ USE_CUDA=0
 RUN_PREPARE_REAL=0
 RUN_LLM_AGENT=0
 RUN_FULLPOOL=1
+RUN_KGQA_BASELINES=1
 
 CWQ_PATH=""
 WEBQSP_PATH=""
@@ -76,6 +77,7 @@ Options:
   --include-datasets "cwq webqsp"
   --run-llm-agent
   --skip-fullpool
+  --skip-kgqa-baselines
   --llm-api-base URL
   --llm-api-key KEY
   --llm-model NAME
@@ -101,6 +103,7 @@ while [[ $# -gt 0 ]]; do
     --include-datasets) INCLUDE_DATASETS_STR="$2"; shift 2 ;;
     --run-llm-agent) RUN_LLM_AGENT=1; shift ;;
     --skip-fullpool) RUN_FULLPOOL=0; shift ;;
+    --skip-kgqa-baselines) RUN_KGQA_BASELINES=0; shift ;;
     --llm-api-base) LLM_API_BASE="$2"; shift 2 ;;
     --llm-api-key) LLM_API_KEY="$2"; shift 2 ;;
     --llm-model) LLM_MODEL="$2"; shift 2 ;;
@@ -292,6 +295,22 @@ run_cmd "${LOG_DIR}/05_main_eval.log" \
   --value_ckpt "$REF_VALUE_CKPT" \
   --out "$MAIN_OUT"
 
+KGQA_BASELINES_OUT="${RESULT_ROOT}/kgqa_baselines_seed${REF_SEED}"
+if [[ "$RUN_KGQA_BASELINES" -eq 1 ]]; then
+  KGQA_BASELINES_CMD=(
+    python scripts/run_kgqa_baselines.py
+    --base-config "$EVAL_MAIN_CFG"
+    --ae_ckpt "$AE_CKPT"
+    --planner_ckpt "$REF_PLANNER_CKPT"
+    --value_ckpt "$REF_VALUE_CKPT"
+    --out_root "$KGQA_BASELINES_OUT"
+    --ref-label diplan_full
+    --bootstrap 2000
+  )
+  if [[ "$USE_CUDA" -eq 1 ]]; then KGQA_BASELINES_CMD+=(--use-cuda); fi
+  run_cmd "${LOG_DIR}/06_kgqa_baselines.log" "${KGQA_BASELINES_CMD[@]}"
+fi
+
 ABLATION_CFG="${RESULT_ROOT}/generated_configs/ablation_seed${REF_SEED}.json"
 cat > "$ABLATION_CFG" <<EOF
 {
@@ -398,6 +417,7 @@ Key outputs:
   - ${RESULT_ROOT}/multiseed_cross_infonce
   - ${RESULT_ROOT}/multiseed_fullpool_listwise
   - ${MAIN_OUT}/summary_metrics.json
+  - ${KGQA_BASELINES_OUT}/tables/kgqa_baselines_aggregate.csv
   - ${ABLATION_OUT}
   - ${SUMMARY_OUT}
 EOF

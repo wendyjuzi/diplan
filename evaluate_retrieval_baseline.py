@@ -29,9 +29,13 @@ def _save_summary_csv(path: str, summary: Dict[str, Dict]) -> None:
         "token_cost",
         "latency_cost",
         "diversity_coverage",
+        "candidate_pool_hit_rate",
+        "ranking_error_rate",
+        "candidate_pool_avg_size",
+        "conditional_success_given_pool_hit",
     ]
     with open(path, "w", encoding="utf-8", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=fields)
+        w = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
         w.writeheader()
         for m, met in summary.items():
             row = {"method": m}
@@ -107,6 +111,14 @@ def main() -> None:
     cfg = load_config(args.config)
     train_rows = load_jsonl(cfg["train_path"])
     test_rows = load_jsonl(cfg["test_path"])
+    include_datasets = [str(x).lower() for x in cfg.get("include_datasets", [])]
+    if include_datasets:
+        test_rows = [r for r in test_rows if str(r.get("dataset", "")).lower() in set(include_datasets)]
+        print(f"[retrieval] include_datasets={include_datasets} kept={len(test_rows)}")
+    max_tasks = int(cfg.get("max_tasks", 0))
+    if max_tasks > 0:
+        test_rows = test_rows[:max_tasks]
+        print(f"[retrieval] max_tasks={max_tasks} kept={len(test_rows)}")
     seed = int(cfg.get("seed", 42))
     random.seed(seed)
 
@@ -123,6 +135,8 @@ def main() -> None:
         candidates = _retrieve(row.get("query_tokens", []), token_to_ids, path_bank, top_k=top_k)
         predicted = candidates[0] if candidates else fallback_path
         feasible, violations = _is_feasible(predicted, row["constraints"])
+        oracle_in_candidate_pool = tuple(row["oracle_path"]) in {tuple(c) for c in candidates}
+        success = predicted == row["oracle_path"]
         rec = {
             "task_id": row["task_id"],
             "dataset": row["dataset"],
@@ -132,7 +146,7 @@ def main() -> None:
             "oracle_path": row["oracle_path"],
             "planned_path": predicted,
             "executed_path": predicted,
-            "success": predicted == row["oracle_path"],
+            "success": success,
             "first_error_step": first_error_step(predicted, row["oracle_path"]),
             "recovery_at_error": recovery_at_error(predicted, row["oracle_path"]),
             "trap_at_1": trap_at_1(predicted, row["trap_path"]),
@@ -142,10 +156,25 @@ def main() -> None:
             "token_cost": len(predicted),
             "latency_cost": 0.001 * max(1, len(candidates)),
             "diversity_coverage": float(len({tuple(x) for x in candidates}) / max(1, len(candidates) if candidates else 1)),
+            "oracle_in_candidate_pool": oracle_in_candidate_pool,
+            "candidate_pool_size": len({tuple(x) for x in candidates}),
+            "ranking_error": bool((not success) and oracle_in_candidate_pool),
         }
         records.append(rec)
 
     summary = {method: aggregate_method_metrics(records)}
+    summary[method].update(
+        {
+            "candidate_pool_hit_rate": sum(1.0 if r["oracle_in_candidate_pool"] else 0.0 for r in records)
+            / max(1, len(records)),
+            "ranking_error_rate": sum(1.0 if r["ranking_error"] else 0.0 for r in records) / max(1, len(records)),
+            "candidate_pool_avg_size": sum(float(r["candidate_pool_size"]) for r in records) / max(1, len(records)),
+            "conditional_success_given_pool_hit": (
+                sum(1.0 if r["success"] else 0.0 for r in records if r["oracle_in_candidate_pool"])
+                / max(1, sum(1 for r in records if r["oracle_in_candidate_pool"]))
+            ),
+        }
+    )
     ensure_dir(args.out)
     dump_jsonl(str(Path(args.out) / "predictions.jsonl"), records)
     dump_json(str(Path(args.out) / "summary_metrics.json"), summary)
@@ -156,4 +185,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
