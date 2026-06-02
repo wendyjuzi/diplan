@@ -685,6 +685,19 @@ def _predict_diplan(
                 generated_all.extend(c_gen)
         generated_unique, generated_counts = _dedupe_with_count(generated_all)
         cands = _merge_candidates(generated_unique, memory_candidates)
+        if not cands:
+            return {
+                "planned_path": [],
+                "executed_path": [],
+                "candidate_count": 0,
+                "candidate_unique_ratio": 0.0,
+                "violations": [],
+                "replanning_steps": 1,
+                "candidate_pool_hit": False,
+                "candidate_pool_size": 0,
+                "candidate_pool_top": [],
+                "retrieval_fusion_used": False,
+            }
         mem_set = {tuple(x) for x in memory_candidates}
         mem_rank_scores = _memory_rank_scores(memory_candidates)
         first_hop_counts: Dict[str, int] = defaultdict(int)
