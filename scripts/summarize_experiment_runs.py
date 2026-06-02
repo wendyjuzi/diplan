@@ -37,11 +37,18 @@ def _load_run(label: str, run_dir: Path) -> Dict:
 
 
 def _write_csv(path: Path, rows: List[Dict], header: List[str]) -> None:
+    all_fields = list(header)
+    seen = set(all_fields)
+    for row in rows:
+        for key in row.keys():
+            if key not in seen:
+                seen.add(key)
+                all_fields.append(key)
     with path.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=header, extrasaction="ignore")
+        writer = csv.DictWriter(f, fieldnames=all_fields, extrasaction="ignore")
         writer.writeheader()
         for r in rows:
-            writer.writerow(r)
+            writer.writerow({key: r.get(key, "") for key in all_fields})
 
 
 def _dataset_breakdown(run: Dict) -> List[Dict]:
