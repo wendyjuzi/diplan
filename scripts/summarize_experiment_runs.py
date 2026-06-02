@@ -38,7 +38,7 @@ def _load_run(label: str, run_dir: Path) -> Dict:
 
 def _write_csv(path: Path, rows: List[Dict], header: List[str]) -> None:
     with path.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=header)
+        writer = csv.DictWriter(f, fieldnames=header, extrasaction="ignore")
         writer.writeheader()
         for r in rows:
             writer.writerow(r)
@@ -142,6 +142,7 @@ def main() -> None:
         "latency_cost",
         "diversity_coverage",
     ]
+    agg_header += sorted({k for r in aggregate_rows for k in r.keys() if k not in set(agg_header)})
     _write_csv(out_dir / f"{args.prefix}_aggregate.csv", aggregate_rows, agg_header)
 
     ds_rows = []
