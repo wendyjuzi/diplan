@@ -34,6 +34,11 @@ METRIC_KEYS = [
     "candidate_pool_avg_size",
     "conditional_success_given_pool_hit",
     "retrieval_fusion_rate",
+    "oracle_mrr",
+    "oracle_hit_at_1",
+    "oracle_hit_at_3",
+    "oracle_hit_at_5",
+    "oracle_rank_mean",
     "llm_error_rate",
     "llm_fallback_rate",
 ]

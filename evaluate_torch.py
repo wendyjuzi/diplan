@@ -262,6 +262,22 @@ def _maybe_apply_retrieval_fusion(
     return fused, True
 
 
+def _candidate_rank_metrics(order: List[int], cands: List[List[str]], oracle: List[str]) -> Dict[str, float | int]:
+    oracle_key = tuple(oracle)
+    rank = 0
+    for pos, idx in enumerate(order, start=1):
+        if tuple(cands[idx]) == oracle_key:
+            rank = pos
+            break
+    return {
+        "oracle_rank": rank,
+        "oracle_mrr": (1.0 / rank) if rank > 0 else 0.0,
+        "oracle_hit_at_1": 1.0 if rank == 1 else 0.0,
+        "oracle_hit_at_3": 1.0 if 0 < rank <= 3 else 0.0,
+        "oracle_hit_at_5": 1.0 if 0 < rank <= 5 else 0.0,
+    }
+
+
 def _save_summary_csv(path: str, summary: Dict[str, Dict]) -> None:
     ensure_dir(str(Path(path).parent))
     base_fields = [
@@ -697,6 +713,11 @@ def _predict_diplan(
                 "candidate_pool_size": 0,
                 "candidate_pool_top": [],
                 "retrieval_fusion_used": False,
+                "oracle_rank": 0,
+                "oracle_mrr": 0.0,
+                "oracle_hit_at_1": 0.0,
+                "oracle_hit_at_3": 0.0,
+                "oracle_hit_at_5": 0.0,
             }
         mem_set = {tuple(x) for x in memory_candidates}
         mem_rank_scores = _memory_rank_scores(memory_candidates)
@@ -774,6 +795,7 @@ def _predict_diplan(
         )
         retrieval_fusion_used = retrieval_fusion_used or fusion_used
         best = selection_order[0]
+        rank_metrics = _candidate_rank_metrics(selection_order, cands, row["oracle_path"])
         if save_candidate_pool_topk > 0:
             for i in idx_sorted[: min(save_candidate_pool_topk, len(idx_sorted))]:
                 candidate_debug.append(
@@ -822,6 +844,7 @@ def _predict_diplan(
             "candidate_pool_size": len(pool_seen),
             "candidate_pool_top": candidate_debug,
             "retrieval_fusion_used": retrieval_fusion_used,
+            **rank_metrics,
         }
         if save_episode_trace:
             out["episode_trace"] = episode_trace
@@ -1334,6 +1357,11 @@ def main() -> None:
             "candidate_pool_size": int(pred.get("candidate_pool_size", 0)),
             "ranking_error": bool((not success) and oracle_in_candidate_pool),
             "retrieval_fusion_used": bool(pred.get("retrieval_fusion_used", False)),
+            "oracle_rank": int(pred.get("oracle_rank", 0)),
+            "oracle_mrr": float(pred.get("oracle_mrr", 0.0)),
+            "oracle_hit_at_1": float(pred.get("oracle_hit_at_1", 0.0)),
+            "oracle_hit_at_3": float(pred.get("oracle_hit_at_3", 0.0)),
+            "oracle_hit_at_5": float(pred.get("oracle_hit_at_5", 0.0)),
             "prefix_step_penalty_alpha": float(row_prefix_alpha),
             "prefix_step_penalty_alpha_source": alpha_source,
         }
@@ -1360,6 +1388,12 @@ def main() -> None:
             "candidate_pool_avg_size": sum(float(r["candidate_pool_size"]) for r in records) / max(1, len(records)),
             "retrieval_fusion_rate": sum(1.0 if r.get("retrieval_fusion_used") else 0.0 for r in records)
             / max(1, len(records)),
+            "oracle_mrr": sum(float(r.get("oracle_mrr", 0.0)) for r in records) / max(1, len(records)),
+            "oracle_hit_at_1": sum(float(r.get("oracle_hit_at_1", 0.0)) for r in records) / max(1, len(records)),
+            "oracle_hit_at_3": sum(float(r.get("oracle_hit_at_3", 0.0)) for r in records) / max(1, len(records)),
+            "oracle_hit_at_5": sum(float(r.get("oracle_hit_at_5", 0.0)) for r in records) / max(1, len(records)),
+            "oracle_rank_mean": sum(float(r.get("oracle_rank", 0.0)) for r in records if int(r.get("oracle_rank", 0)) > 0)
+            / max(1, sum(1 for r in records if int(r.get("oracle_rank", 0)) > 0)),
             "conditional_success_given_pool_hit": (
                 sum(1.0 if r["success"] else 0.0 for r in records if r["oracle_in_candidate_pool"])
                 / max(1, sum(1 for r in records if r["oracle_in_candidate_pool"]))
@@ -1382,6 +1416,10 @@ def main() -> None:
                 "candidate_pool_avg_size": sum(float(r["candidate_pool_size"]) for r in ds_recs) / max(1, len(ds_recs)),
                 "retrieval_fusion_rate": sum(1.0 if r.get("retrieval_fusion_used") else 0.0 for r in ds_recs)
                 / max(1, len(ds_recs)),
+                "oracle_mrr": sum(float(r.get("oracle_mrr", 0.0)) for r in ds_recs) / max(1, len(ds_recs)),
+                "oracle_hit_at_1": sum(float(r.get("oracle_hit_at_1", 0.0)) for r in ds_recs) / max(1, len(ds_recs)),
+                "oracle_hit_at_3": sum(float(r.get("oracle_hit_at_3", 0.0)) for r in ds_recs) / max(1, len(ds_recs)),
+                "oracle_hit_at_5": sum(float(r.get("oracle_hit_at_5", 0.0)) for r in ds_recs) / max(1, len(ds_recs)),
             }
         )
     dump_json(str(Path(args.out) / "summary_by_dataset.json"), by_dataset)
