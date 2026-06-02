@@ -63,6 +63,7 @@ def _setting_eval_cfg(seed: int, train_path: str, test_path: str, use_cuda: bool
                 "rerank_consensus_weight": 0.75,
                 "rerank_prefix_consensus_weight": 0.9,
                 "rerank_memory_bonus": 0.15,
+                "rerank_memory_rank_bonus": 0.6,
                 "rerank_stage2_length_penalty_alpha": 0.08,
                 "save_candidate_pool_topk": 12,
             }

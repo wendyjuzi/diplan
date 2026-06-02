@@ -1,0 +1,18 @@
+{
+  "train_path": "data/real_processed/kgqa_train.jsonl",
+  "seed": 42,
+  "max_path_len": 8,
+  "max_query_len": 24,
+  "batch_size": 256,
+  "emb_dim": 128,
+  "lr": 0.00025,
+  "epochs": 4,
+  "use_cuda": false,
+  "value_architecture": "cross",
+  "value_hidden_dim": 256,
+  "value_dropout": 0.1,
+  "training_mode": "full_pool_listwise",
+  "infonce_temperature": 0.2,
+  "full_pool_candidates_path": "results/tune5_full_pool_seed42/train_full_pool_candidates.jsonl",
+  "full_pool_num_negatives": 31
+}

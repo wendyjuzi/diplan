@@ -473,6 +473,7 @@ def main() -> None:
     planner_ckpt = torch.load(args.planner_ckpt, map_location="cpu")
     path_vocab = load_vocab(planner_ckpt["path_vocab"])
     query_vocab = load_vocab(planner_ckpt["query_vocab"])
+    ranking_margin = float(cfg.get("ranking_margin", 0.2))
     training_mode = str(cfg.get("training_mode", "bce")).lower()
     if training_mode not in {"bce", "pairwise", "infonce", "full_pool_listwise"}:
         raise ValueError(
@@ -611,7 +612,6 @@ def main() -> None:
     best_loss = float("inf")
     best_state = None
     epochs = int(cfg.get("epochs", 8))
-    ranking_margin = float(cfg.get("ranking_margin", 0.2))
     infonce_temperature = float(cfg.get("infonce_temperature", 0.2))
     for ep in range(1, epochs + 1):
         model.train()

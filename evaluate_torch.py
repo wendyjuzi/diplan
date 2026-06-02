@@ -7,6 +7,7 @@ from typing import Dict, List, Tuple
 import torch
 
 from src.diplan.io_utils import dump_json, dump_jsonl, ensure_dir, load_config, load_jsonl
+from src.diplan.failure_memory import build_failure_memory
 from src.diplan.metrics import (
     aggregate_method_metrics,
     first_error_step,
@@ -14,6 +15,8 @@ from src.diplan.metrics import (
     recovery_at_error,
     trap_at_1,
 )
+from src.diplan.plan_schema import path_to_structured_plan
+from src.diplan.tool_decoder import path_to_tool_calls
 from src.diplan.torch_pipeline import (
     EOS,
     PAD,
@@ -95,6 +98,15 @@ def _merge_candidates(generated: List[List[str]], memory: List[List[str]]) -> Li
             seen.add(key)
             out.append(c)
     return out
+
+
+def _memory_rank_scores(memory: List[List[str]]) -> Dict[Tuple[str, ...], float]:
+    scores: Dict[Tuple[str, ...], float] = {}
+    for rank, c in enumerate(memory):
+        key = tuple(c)
+        if key not in scores:
+            scores[key] = 1.0 / float(rank + 1)
+    return scores
 
 
 def _filter_feasible_candidates(candidates: List[List[str]], constraints: Dict) -> Tuple[List[List[str]], int]:
@@ -307,9 +319,100 @@ def _dedupe_with_count(candidates: List[List[str]]) -> Tuple[List[List[str]], Di
 
 
 @torch.no_grad()
+def _decode_latents_to_paths(
+    autoencoder: PathAutoencoder,
+    path_vocab,
+    z: torch.Tensor,
+    max_path_len: int,
+) -> List[List[str]]:
+    seq_ids, pred_lens = autoencoder.decode_greedy(
+        z,
+        bos_id=path_vocab.stoi["<bos>"],
+        eos_id=path_vocab.stoi[EOS],
+        max_len=max_path_len,
+    )
+    cands = []
+    for ids, ln in zip(seq_ids, pred_lens):
+        ids = ids[: max(1, min(ln, max_path_len))]
+        cands.append(path_vocab.decode(ids, skip_special=True))
+    return cands
+
+
+@torch.no_grad()
+def _sample_latent_value_guided(
+    planner: DiffusionPlanner,
+    autoencoder: PathAutoencoder,
+    value_model: ValueRanker | None,
+    path_vocab,
+    query_vocab,
+    query_tokens: List[str],
+    q_ids: torch.Tensor,
+    latent_dim: int,
+    diffusion_steps: int,
+    max_path_len: int,
+    device: torch.device,
+    latent_mean: torch.Tensor | None,
+    latent_std: torch.Tensor | None,
+    prediction_target: str,
+    guidance_scale: float,
+    guidance_interval: int,
+    guidance_temperature: float,
+    expected_len: float | None,
+    length_penalty_alpha: float,
+) -> torch.Tensor:
+    betas = torch.linspace(1e-4, 0.02, diffusion_steps, device=device)
+    alphas = 1.0 - betas
+    alpha_bars = torch.cumprod(alphas, dim=0)
+    z = torch.randn((q_ids.size(0), latent_dim), device=device)
+    target = prediction_target.lower()
+    interval = max(1, int(guidance_interval))
+    temp = max(1e-6, float(guidance_temperature))
+
+    for t in reversed(range(diffusion_steps)):
+        t_idx = torch.full((q_ids.size(0),), t, dtype=torch.long, device=device)
+        t_norm = t_idx.float() / max(1, diffusion_steps - 1)
+        a_t = alpha_bars[t]
+        model_out = planner(z, q_ids, t_norm)
+        if target == "z0":
+            z0 = model_out
+            eps = (z - a_t.sqrt() * z0) / (1.0 - a_t).sqrt().clamp(min=1e-6)
+        else:
+            eps = model_out
+            z0 = (z - (1.0 - a_t).sqrt() * eps) / a_t.sqrt().clamp(min=1e-6)
+
+        should_guide = value_model is not None and guidance_scale > 0.0 and (t % interval == 0 or t == diffusion_steps - 1)
+        if should_guide:
+            z_decode = z0
+            if latent_mean is not None and latent_std is not None:
+                z_decode = z_decode * latent_std + latent_mean
+            cands = _decode_latents_to_paths(autoencoder, path_vocab, z_decode, max_path_len)
+            scores = _score_candidates(
+                value_model=value_model,
+                path_vocab=path_vocab,
+                query_vocab=query_vocab,
+                query_tokens=query_tokens,
+                candidates=cands,
+                device=device,
+                expected_len=expected_len,
+                length_penalty_alpha=length_penalty_alpha,
+            )
+            weights = torch.softmax(torch.tensor(scores, dtype=torch.float32, device=device) / temp, dim=0).view(-1, 1)
+            center = (weights * z0).sum(dim=0, keepdim=True)
+            z0 = z0 + float(guidance_scale) * (center - z0)
+
+        if t == 0:
+            z = z0
+            continue
+        a_prev = alpha_bars[t - 1]
+        z = a_prev.sqrt() * z0 + (1.0 - a_prev).sqrt() * eps
+    return z
+
+
+@torch.no_grad()
 def _generate_candidates(
     planner: DiffusionPlanner | MLPPlanner,
     autoencoder: PathAutoencoder,
+    value_model: ValueRanker | None,
     path_vocab,
     query_vocab,
     query_tokens: List[str],
@@ -322,6 +425,12 @@ def _generate_candidates(
     prediction_target: str = "z0",
     planner_type: str = "diffusion",
     candidate_latent_jitter_std: float = 0.0,
+    value_guided_sampling: bool = False,
+    value_guidance_scale: float = 0.0,
+    value_guidance_interval: int = 4,
+    value_guidance_temperature: float = 0.5,
+    expected_len: float | None = None,
+    length_penalty_alpha: float = 0.0,
 ) -> Tuple[List[List[str]], float]:
     q_ids = query_vocab.encode(query_tokens, add_bos_eos=False, max_len=24)
     if not q_ids:
@@ -329,6 +438,28 @@ def _generate_candidates(
     q_batch = torch.tensor([q_ids for _ in range(num_candidates)], dtype=torch.long, device=device)
     if planner_type == "mlp":
         z = planner(q_batch)
+    elif value_guided_sampling and value_model is not None:
+        z = _sample_latent_value_guided(
+            planner=planner,
+            autoencoder=autoencoder,
+            value_model=value_model,
+            path_vocab=path_vocab,
+            query_vocab=query_vocab,
+            query_tokens=query_tokens,
+            q_ids=q_batch,
+            latent_dim=planner.latent_dim,
+            diffusion_steps=diffusion_steps,
+            max_path_len=max_path_len,
+            device=device,
+            latent_mean=latent_mean,
+            latent_std=latent_std,
+            prediction_target=prediction_target,
+            guidance_scale=value_guidance_scale,
+            guidance_interval=value_guidance_interval,
+            guidance_temperature=value_guidance_temperature,
+            expected_len=expected_len,
+            length_penalty_alpha=length_penalty_alpha,
+        )
     else:
         z = sample_latent(
             planner=planner,
@@ -342,16 +473,7 @@ def _generate_candidates(
         z = z + torch.randn_like(z) * candidate_latent_jitter_std
     if latent_mean is not None and latent_std is not None:
         z = z * latent_std + latent_mean
-    seq_ids, pred_lens = autoencoder.decode_greedy(
-        z,
-        bos_id=path_vocab.stoi["<bos>"],
-        eos_id=path_vocab.stoi[EOS],
-        max_len=max_path_len,
-    )
-    cands = []
-    for ids, ln in zip(seq_ids, pred_lens):
-        ids = ids[: max(1, min(ln, max_path_len))]
-        cands.append(path_vocab.decode(ids, skip_special=True))
+    cands = _decode_latents_to_paths(autoencoder, path_vocab, z, max_path_len)
     uniq = len({tuple(x) for x in cands}) / max(1, len(cands))
     return cands, float(uniq)
 
@@ -452,10 +574,15 @@ def _predict_diplan(
     rerank_stage1_topk: int,
     rerank_consensus_weight: float,
     rerank_memory_bonus: float,
+    rerank_memory_rank_bonus: float,
     rerank_stage2_length_penalty_alpha: float,
     rerank_prefix_consensus_weight: float,
     prefix_step_penalty_alpha: float,
     prefix_step_penalty_gamma: float,
+    value_guided_sampling: bool,
+    value_guidance_scale: float,
+    value_guidance_interval: int,
+    value_guidance_temperature: float,
     save_candidate_pool_topk: int,
     save_episode_trace: bool,
 ) -> Dict:
@@ -475,6 +602,7 @@ def _predict_diplan(
             c_gen, _ = _generate_candidates(
                 planner,
                 autoencoder,
+                value_model,
                 path_vocab,
                 query_vocab,
                 query_tokens,
@@ -487,11 +615,18 @@ def _predict_diplan(
                 prediction_target=prediction_target,
                 planner_type=planner_type,
                 candidate_latent_jitter_std=jit,
+                value_guided_sampling=value_guided_sampling,
+                value_guidance_scale=value_guidance_scale,
+                value_guidance_interval=value_guidance_interval,
+                value_guidance_temperature=value_guidance_temperature,
+                expected_len=expected_total_len,
+                length_penalty_alpha=length_penalty_alpha,
             )
             generated_all.extend(c_gen)
         generated_unique, generated_counts = _dedupe_with_count(generated_all)
         cands = _merge_candidates(generated_unique, memory_candidates)
         mem_set = {tuple(x) for x in memory_candidates}
+        mem_rank_scores = _memory_rank_scores(memory_candidates)
         first_hop_counts: Dict[str, int] = defaultdict(int)
         for c in cands:
             if c:
@@ -521,6 +656,13 @@ def _predict_diplan(
         )
         if prefix_step_penalty_alpha > 0.0:
             scores = [s - prefix_step_penalty_alpha * p for s, p in zip(scores, prefix_penalties)]
+        failure_weights = row.get("_failure_bad_first_action_weights", {})
+        failure_penalty = float(row.get("_failure_action_penalty", 0.0))
+        if failure_penalty > 0.0 and isinstance(failure_weights, dict):
+            scores = [
+                s - failure_penalty * float(failure_weights.get(c[0], 0.0) if c else 0.0)
+                for s, c in zip(scores, cands)
+            ]
         all_candidates.extend(cands)
         idx_sorted = sorted(range(len(cands)), key=lambda i: scores[i], reverse=True)
         best = idx_sorted[0]
@@ -535,11 +677,13 @@ def _predict_diplan(
                     first_hop_counts.get(cands[i][0], 0) / max(1, total_first) if cands[i] else 0.0
                 )
                 len_pen = rerank_stage2_length_penalty_alpha * abs(len(cands[i]) - expected_total_len)
+                memory_rank = mem_rank_scores.get(key, 0.0)
                 stage2_scores[i] = (
                     scores[i]
                     + rerank_consensus_weight * consensus
                     + rerank_prefix_consensus_weight * first_hop_consensus
                     + rerank_memory_bonus * in_memory
+                    + rerank_memory_rank_bonus * memory_rank
                     - len_pen
                 )
             best = max(topk, key=lambda i: stage2_scores.get(i, -1e18))
@@ -551,6 +695,7 @@ def _predict_diplan(
                         "stage1_score": float(scores[i]),
                         "in_memory": bool(tuple(cands[i]) in mem_set),
                         "gen_count": int(generated_counts.get(tuple(cands[i]), 0)),
+                        "memory_rank_score": float(mem_rank_scores.get(tuple(cands[i]), 0.0)),
                         "first_hop_consensus": (
                             first_hop_counts.get(cands[i][0], 0) / max(1, total_first) if cands[i] else 0.0
                         ),
@@ -604,6 +749,7 @@ def _predict_diplan(
             c_gen, _ = _generate_candidates(
                 planner,
                 autoencoder,
+                value_model,
                 path_vocab,
                 query_vocab,
                 rem_q,
@@ -616,11 +762,18 @@ def _predict_diplan(
                 prediction_target=prediction_target,
                 planner_type=planner_type,
                 candidate_latent_jitter_std=jit,
+                value_guided_sampling=value_guided_sampling,
+                value_guidance_scale=value_guidance_scale,
+                value_guidance_interval=value_guidance_interval,
+                value_guidance_temperature=value_guidance_temperature,
+                expected_len=expected_remaining,
+                length_penalty_alpha=length_penalty_alpha,
             )
             generated_all.extend(c_gen)
         generated_unique, generated_counts = _dedupe_with_count(generated_all)
         cands = _merge_candidates(generated_unique, memory_candidates)
         mem_set = {tuple(x) for x in memory_candidates}
+        mem_rank_scores = _memory_rank_scores(memory_candidates)
         first_hop_counts: Dict[str, int] = defaultdict(int)
         for c in cands:
             if c:
@@ -651,6 +804,13 @@ def _predict_diplan(
         )
         if prefix_step_penalty_alpha > 0.0:
             scores = [s - prefix_step_penalty_alpha * p for s, p in zip(scores, prefix_penalties)]
+        failure_weights = row.get("_failure_bad_first_action_weights", {})
+        failure_penalty = float(row.get("_failure_action_penalty", 0.0))
+        if failure_penalty > 0.0 and isinstance(failure_weights, dict):
+            scores = [
+                s - failure_penalty * float(failure_weights.get(c[0], 0.0) if c else 0.0)
+                for s, c in zip(scores, cands)
+            ]
         all_candidates.extend(cands)
         uniq_vals.append(uniq)
         idx_sorted = sorted(range(len(cands)), key=lambda i: scores[i], reverse=True)
@@ -665,11 +825,13 @@ def _predict_diplan(
                     first_hop_counts.get(cands[i][0], 0) / max(1, total_first) if cands[i] else 0.0
                 )
                 len_pen = rerank_stage2_length_penalty_alpha * abs(len(cands[i]) - expected_remaining)
+                memory_rank = mem_rank_scores.get(key, 0.0)
                 stage2_scores[i] = (
                     scores[i]
                     + rerank_consensus_weight * consensus
                     + rerank_prefix_consensus_weight * first_hop_consensus
                     + rerank_memory_bonus * in_memory
+                    + rerank_memory_rank_bonus * memory_rank
                     - len_pen
                 )
             idx_sorted = sorted(topk, key=lambda i: stage2_scores.get(i, -1e18), reverse=True)
@@ -681,6 +843,7 @@ def _predict_diplan(
                         "stage1_score": float(scores[i]),
                         "in_memory": bool(tuple(cands[i]) in mem_set),
                         "gen_count": int(generated_counts.get(tuple(cands[i]), 0)),
+                        "memory_rank_score": float(mem_rank_scores.get(tuple(cands[i]), 0.0)),
                         "first_hop_consensus": (
                             first_hop_counts.get(cands[i][0], 0) / max(1, total_first) if cands[i] else 0.0
                         ),
@@ -888,12 +1051,30 @@ def main() -> None:
     rerank_stage1_topk = int(cfg.get("rerank_stage1_topk", 0))
     rerank_consensus_weight = float(cfg.get("rerank_consensus_weight", 0.0))
     rerank_memory_bonus = float(cfg.get("rerank_memory_bonus", 0.0))
+    rerank_memory_rank_bonus = float(cfg.get("rerank_memory_rank_bonus", 0.0))
     rerank_stage2_length_penalty_alpha = float(cfg.get("rerank_stage2_length_penalty_alpha", 0.0))
     rerank_prefix_consensus_weight = float(cfg.get("rerank_prefix_consensus_weight", 0.0))
     prefix_step_penalty_alpha = float(cfg.get("prefix_step_penalty_alpha", 0.0))
     prefix_step_penalty_gamma = float(cfg.get("prefix_step_penalty_gamma", 0.85))
+    value_guided_sampling = bool(cfg.get("value_guided_sampling", False))
+    value_guidance_scale = float(cfg.get("value_guidance_scale", 0.0))
+    value_guidance_interval = int(cfg.get("value_guidance_interval", 4))
+    value_guidance_temperature = float(cfg.get("value_guidance_temperature", 0.5))
     save_candidate_pool_topk = int(cfg.get("save_candidate_pool_topk", 0))
     save_episode_trace = bool(cfg.get("save_episode_trace", False))
+    emit_structured_plan = bool(cfg.get("emit_structured_plan", False))
+    emit_tool_calls = bool(cfg.get("emit_tool_calls", False))
+    failure_memory = None
+    failure_memory_path = str(cfg.get("failure_memory_path", "")).strip()
+    failure_action_penalty = float(cfg.get("failure_action_penalty", 0.0))
+    failure_memory_top_k = int(cfg.get("failure_memory_top_k", 8))
+    if failure_memory_path:
+        failure_rows = load_jsonl(failure_memory_path)
+        failure_memory = build_failure_memory(
+            failure_rows,
+            max_postings_per_token=int(cfg.get("failure_memory_max_postings_per_token", 1200)),
+        )
+        print(f"[failure-memory] enabled, failures={len(failure_memory.rows)}, penalty={failure_action_penalty:.3f}")
     adaptive_prefix_alpha_enabled = bool(cfg.get("adaptive_prefix_alpha_enabled", False))
     if adaptive_prefix_alpha_enabled:
         print(
@@ -901,10 +1082,28 @@ def main() -> None:
             f"mode={str(cfg.get('adaptive_prefix_alpha_mode', 'dataset')).lower()}, "
             f"default_alpha={prefix_step_penalty_alpha:.3f}"
         )
+    if value_guided_sampling:
+        print(
+            "[eval] value_guided_sampling enabled, "
+            f"scale={value_guidance_scale:.3f}, interval={value_guidance_interval}, "
+            f"temperature={value_guidance_temperature:.3f}"
+        )
+        if planner_type != "diffusion":
+            print("[eval] value_guided_sampling is only active for diffusion planners; current planner is not diffusion.")
+        if value_model is None:
+            print("[eval] value_guided_sampling requested but value_model is disabled or missing.")
     records = []
     memory_prefilter_dropped = 0
     alpha_bucket_counter: Dict[str, int] = defaultdict(int)
     for row in rows:
+        row_for_pred = dict(row)
+        failure_hits = []
+        failure_bad_first_action_weights = {}
+        if failure_memory is not None:
+            failure_hits = failure_memory.retrieve(row.get("query_tokens", []), top_k=failure_memory_top_k)
+            failure_bad_first_action_weights = failure_memory.bad_first_action_weights(failure_hits)
+            row_for_pred["_failure_bad_first_action_weights"] = failure_bad_first_action_weights
+            row_for_pred["_failure_action_penalty"] = failure_action_penalty
         mem_cands = (
             _retrieve_memory_candidates(row["query_tokens"], token_to_ids, path_bank, top_k=memory_top_k)
             if use_memory_retrieval
@@ -920,7 +1119,7 @@ def main() -> None:
         )
         alpha_bucket_counter[f"{alpha_source}:{row_prefix_alpha:.3f}"] += 1
         pred = _predict_diplan(
-            row=row,
+            row=row_for_pred,
             planner=planner,
             autoencoder=autoencoder,
             value_model=value_model,
@@ -947,10 +1146,15 @@ def main() -> None:
             rerank_stage1_topk=rerank_stage1_topk,
             rerank_consensus_weight=rerank_consensus_weight,
             rerank_memory_bonus=rerank_memory_bonus,
+            rerank_memory_rank_bonus=rerank_memory_rank_bonus,
             rerank_stage2_length_penalty_alpha=rerank_stage2_length_penalty_alpha,
             rerank_prefix_consensus_weight=rerank_prefix_consensus_weight,
             prefix_step_penalty_alpha=row_prefix_alpha,
             prefix_step_penalty_gamma=prefix_step_penalty_gamma,
+            value_guided_sampling=value_guided_sampling,
+            value_guidance_scale=value_guidance_scale,
+            value_guidance_interval=value_guidance_interval,
+            value_guidance_temperature=value_guidance_temperature,
             save_candidate_pool_topk=save_candidate_pool_topk,
             save_episode_trace=save_episode_trace,
         )
@@ -985,6 +1189,14 @@ def main() -> None:
             "prefix_step_penalty_alpha": float(row_prefix_alpha),
             "prefix_step_penalty_alpha_source": alpha_source,
         }
+        if failure_memory is not None:
+            rec["failure_memory_hits"] = len(failure_hits)
+            rec["failure_bad_first_action_weights"] = failure_bad_first_action_weights
+        if emit_structured_plan:
+            rec["structured_planned_path"] = path_to_structured_plan(pred["planned_path"])
+            rec["structured_executed_path"] = path_to_structured_plan(executed)
+        if emit_tool_calls:
+            rec["tool_calls"] = path_to_tool_calls(executed)
         if save_candidate_pool_topk > 0:
             rec["candidate_pool_top"] = pred.get("candidate_pool_top", [])
         if save_episode_trace:

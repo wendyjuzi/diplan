@@ -52,7 +52,11 @@ def main() -> None:
         summary_path = exp_out / "summary_metrics.json"
         with open(summary_path, "r", encoding="utf-8") as f:
             summary = json.load(f)
-        report[name] = summary["diplan_torch"]
+        if not summary:
+            raise ValueError(f"Empty summary_metrics.json for ablation experiment: {name}")
+        method = "diplan_torch" if "diplan_torch" in summary else next(iter(summary.keys()))
+        report[name] = dict(summary[method])
+        report[name]["method"] = method
         met = report[name]
         print(f"{name:>28} | success={met['success_rate']:.3f} first_err={met['first_error_step']:.2f} trap@1={met['trap_at_1']:.3f}")
 
@@ -62,4 +66,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

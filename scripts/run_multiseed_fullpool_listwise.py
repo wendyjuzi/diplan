@@ -75,6 +75,18 @@ def main() -> None:
         help="Root containing seed_x/value_cross_infonce/best.pt (only used as required arg in no-value eval).",
     )
     parser.add_argument(
+        "--baseline_run_name",
+        type=str,
+        default="mlp_memory_prefilter_cross_infonce",
+        help="Baseline run directory name under baseline_root/seed_x.",
+    )
+    parser.add_argument(
+        "--baseline_label",
+        type=str,
+        default="stage4_cross_infonce",
+        help="Label used for the baseline in summary and significance outputs.",
+    )
+    parser.add_argument(
         "--train_eval_cfg_base",
         type=str,
         default="configs/eval_torch_kgqa.tune5.train_pool_export.seed42.json",
@@ -248,12 +260,12 @@ def main() -> None:
         )
 
         # 5) Load stage-4 baseline and stage-5 metrics/predictions.
-        stage4_out = repo / args.baseline_root / f"seed_{seed}" / "mlp_memory_prefilter_cross_infonce_alpha020"
+        stage4_out = repo / args.baseline_root / f"seed_{seed}" / args.baseline_run_name
         if not stage4_out.exists():
             raise FileNotFoundError(f"Missing stage-4 baseline dir: {stage4_out}")
 
         run_map = {
-            "stage4_cross_infonce_alpha020": stage4_out,
+            args.baseline_label: stage4_out,
             "stage5_cross_fullpool_listwise": stage5_out,
         }
         for label, out_dir in run_map.items():
@@ -293,7 +305,7 @@ def main() -> None:
     dump_json(str(out_root / "multiseed_dataset_breakdown.json"), ds_breakdown)
 
     # Paired significance stage5 vs stage4 (across seeds with task alignment per seed).
-    ref_setting = "stage4_cross_infonce_alpha020"
+    ref_setting = args.baseline_label
     oth_setting = "stage5_cross_fullpool_listwise"
     a = []
     b = []
