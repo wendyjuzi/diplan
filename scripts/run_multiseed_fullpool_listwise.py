@@ -12,6 +12,34 @@ from src.diplan.io_utils import dump_json, ensure_dir, load_json, load_jsonl
 from src.diplan.stats_utils import bootstrap_mean_diff, mcnemar_test_paired
 
 
+def _parse_float_list(text: str) -> List[float]:
+    if not text.strip():
+        return []
+    return [float(x) for x in text.replace(",", " ").split() if x.strip()]
+
+
+def _apply_pool_overrides(
+    cfg: Dict,
+    *,
+    num_candidates: int,
+    memory_top_k: int,
+    memory_max_postings_per_token: int,
+    candidate_multi_jitter_stds: List[float],
+    save_candidate_pool_topk: int,
+) -> None:
+    if num_candidates > 0:
+        cfg["num_candidates"] = int(num_candidates)
+        cfg["rerank_stage1_topk"] = int(min(num_candidates, max(12, num_candidates // 2)))
+    if memory_top_k > 0:
+        cfg["memory_top_k"] = int(memory_top_k)
+    if memory_max_postings_per_token > 0:
+        cfg["memory_max_postings_per_token"] = int(memory_max_postings_per_token)
+    if candidate_multi_jitter_stds:
+        cfg["candidate_multi_jitter_stds"] = list(candidate_multi_jitter_stds)
+        cfg["candidate_latent_jitter_std"] = float(max(candidate_multi_jitter_stds))
+    cfg["save_candidate_pool_topk"] = int(save_candidate_pool_topk)
+
+
 def _run(cmd: List[str], cwd: Path) -> None:
     print("[run]", " ".join(cmd))
     subprocess.run(cmd, cwd=str(cwd), check=True)
@@ -126,6 +154,36 @@ def main() -> None:
         action="store_true",
         help="Train listwise value model only on rows where gold appears in retrieved candidate pools.",
     )
+    parser.add_argument(
+        "--pool_size",
+        type=int,
+        default=32,
+        help="Number of candidates used by the listwise training objective, including the gold path.",
+    )
+    parser.add_argument("--train_num_candidates", type=int, default=0)
+    parser.add_argument("--train_memory_top_k", type=int, default=0)
+    parser.add_argument("--train_memory_max_postings_per_token", type=int, default=0)
+    parser.add_argument(
+        "--train_candidate_multi_jitter_stds",
+        type=str,
+        default="",
+        help="Space/comma-separated train-pool jitter stds, e.g. '0.0 0.03 0.06'.",
+    )
+    parser.add_argument("--test_num_candidates", type=int, default=0)
+    parser.add_argument("--test_memory_top_k", type=int, default=0)
+    parser.add_argument("--test_memory_max_postings_per_token", type=int, default=0)
+    parser.add_argument(
+        "--test_candidate_multi_jitter_stds",
+        type=str,
+        default="",
+        help="Space/comma-separated test-pool jitter stds. Defaults to train jitter when omitted.",
+    )
+    parser.add_argument("--value_epochs", type=int, default=0)
+    parser.add_argument("--value_lr", type=float, default=0.0)
+    parser.add_argument("--value_batch_size", type=int, default=0)
+    parser.add_argument("--value_hidden_dim", type=int, default=0)
+    parser.add_argument("--value_dropout", type=float, default=-1.0)
+    parser.add_argument("--value_temperature", type=float, default=0.0)
     args = parser.parse_args()
 
     repo = Path(args.repo_root).resolve()
@@ -140,6 +198,11 @@ def main() -> None:
     train_eval_cfg_base = load_json(str(repo / args.train_eval_cfg_base))
     test_eval_cfg_base = load_json(str(repo / args.test_eval_cfg_base))
     value_cfg_base = load_json(str(repo / args.value_cfg_base))
+    pool_size = int(args.pool_size)
+    if pool_size < 2:
+        raise ValueError("--pool_size must be at least 2.")
+    train_jitter = _parse_float_list(args.train_candidate_multi_jitter_stds)
+    test_jitter = _parse_float_list(args.test_candidate_multi_jitter_stds) or train_jitter
 
     by_seed_summary: Dict[str, List[Dict]] = defaultdict(list)
     by_seed_preds: Dict[str, Dict[int, List[Dict]]] = defaultdict(dict)
@@ -170,12 +233,19 @@ def main() -> None:
                 "use_cuda": bool(args.use_cuda),
                 "use_value_model": False,
                 "use_memory_retrieval": True,
-                "save_candidate_pool_topk": 32,
             }
+        )
+        _apply_pool_overrides(
+            train_eval_cfg,
+            num_candidates=args.train_num_candidates,
+            memory_top_k=args.train_memory_top_k,
+            memory_max_postings_per_token=args.train_memory_max_postings_per_token,
+            candidate_multi_jitter_stds=train_jitter,
+            save_candidate_pool_topk=pool_size,
         )
         train_eval_cfg_path = seed_cfg_dir / "eval_train_pool_export.json"
         _write_json(train_eval_cfg_path, train_eval_cfg)
-        train_eval_out = seed_out_dir / "train_eval_no_value_pool32"
+        train_eval_out = seed_out_dir / f"train_eval_no_value_pool{pool_size}"
         _run(
             [
                 py_exec,
@@ -207,7 +277,7 @@ def main() -> None:
                 "--out",
                 str(full_pool_path),
                 "--pool_size",
-                "32",
+                str(pool_size),
                 "--seed",
                 str(seed),
                 "--use_planned_and_executed",
@@ -224,8 +294,21 @@ def main() -> None:
                 "train_path": args.train_path,
                 "use_cuda": bool(args.use_cuda),
                 "full_pool_candidates_path": str(full_pool_path),
+                "full_pool_num_negatives": pool_size - 1,
             }
         )
+        if args.value_epochs > 0:
+            value_cfg["epochs"] = int(args.value_epochs)
+        if args.value_lr > 0:
+            value_cfg["lr"] = float(args.value_lr)
+        if args.value_batch_size > 0:
+            value_cfg["batch_size"] = int(args.value_batch_size)
+        if args.value_hidden_dim > 0:
+            value_cfg["value_hidden_dim"] = int(args.value_hidden_dim)
+        if args.value_dropout >= 0:
+            value_cfg["value_dropout"] = float(args.value_dropout)
+        if args.value_temperature > 0:
+            value_cfg["infonce_temperature"] = float(args.value_temperature)
         value_cfg_path = seed_cfg_dir / "value_full_pool_listwise.json"
         _write_json(value_cfg_path, value_cfg)
         value_ckpt_dir = seed_run_dir / "value_full_pool_listwise"
@@ -252,6 +335,16 @@ def main() -> None:
                 "test_path": args.test_path,
                 "use_cuda": bool(args.use_cuda),
             }
+        )
+        _apply_pool_overrides(
+            test_eval_cfg,
+            num_candidates=args.test_num_candidates or args.train_num_candidates,
+            memory_top_k=args.test_memory_top_k or args.train_memory_top_k,
+            memory_max_postings_per_token=(
+                args.test_memory_max_postings_per_token or args.train_memory_max_postings_per_token
+            ),
+            candidate_multi_jitter_stds=test_jitter,
+            save_candidate_pool_topk=pool_size,
         )
         test_eval_cfg_path = seed_cfg_dir / "eval_test_stage5.json"
         _write_json(test_eval_cfg_path, test_eval_cfg)

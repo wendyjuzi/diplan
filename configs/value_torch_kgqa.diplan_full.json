@@ -1,0 +1,17 @@
+{
+  "train_path": "data/real_processed/kgqa_train.jsonl",
+  "seed": 42,
+  "max_path_len": 8,
+  "max_query_len": 32,
+  "neg_per_pos": 3,
+  "batch_size": 512,
+  "emb_dim": 128,
+  "lr": 0.0003,
+  "epochs": 4,
+  "training_mode": "infonce",
+  "infonce_num_negatives": 10,
+  "infonce_temperature": 0.2,
+  "value_architecture": "cross",
+  "value_hidden_dim": 256,
+  "use_cuda": true
+}

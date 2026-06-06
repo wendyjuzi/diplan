@@ -12,6 +12,7 @@ PAD = "<pad>"
 BOS = "<bos>"
 EOS = "<eos>"
 UNK = "<unk>"
+SEP = "<sep>"  # separates query tokens from the executed plan prefix (paper §5.1/§5.5)
 
 
 def set_seed(seed: int) -> None:
@@ -94,7 +95,11 @@ class DiffusionDataset(Dataset):
         self.samples = []
         for row in rows:
             path_ids = path_vocab.encode(row["oracle_path"], add_bos_eos=True, max_len=max_path_len)
-            query_ids = query_vocab.encode(row["query_tokens"], add_bos_eos=False, max_len=max_query_len)
+            query_tokens = list(row.get("query_tokens", []))
+            state_prefixes = row.get("state_query_tokens_by_prefix") or []
+            if state_prefixes:
+                query_tokens = list(state_prefixes[0])
+            query_ids = query_vocab.encode(query_tokens, add_bos_eos=False, max_len=max_query_len)
             if len(path_ids) >= 3 and len(query_ids) >= 1:
                 self.samples.append((path_ids, query_ids))
 
@@ -102,6 +107,142 @@ class DiffusionDataset(Dataset):
         return len(self.samples)
 
     def __getitem__(self, idx: int) -> Tuple[List[int], List[int]]:
+        return self.samples[idx]
+
+
+class WeightedDiffusionDataset(Dataset):
+    """Decision-weighted + (optionally) prefix-conditioned diffusion dataset.
+
+    Implements paper §7.3.2: instead of cloning only the oracle plan, build a pool
+    ``{oracle} ∪ candidate_paths`` per task and weight each plan by
+    ``w_i = exp(alpha * Normalize_row(R_i)) * 1{feasible_i}`` where ``R_i`` is 1.0
+    for the oracle and the longest-common-prefix ratio for near-misses.
+
+    When ``prefix_conditioning`` is enabled (paper §5.1/§5.5) the condition stream
+    becomes ``query_tokens [SEP] plan[:k]`` for a randomly sampled cut ``k`` (with a
+    high probability of ``k=0``), so the planner learns state-aware re-planning. The
+    diffusion target stays the full plan latent.
+    """
+
+    def __init__(
+        self,
+        rows: List[Dict],
+        path_vocab: SimpleVocab,
+        query_vocab: SimpleVocab,
+        max_path_len: int,
+        max_query_len: int,
+        alpha: float = 1.0,
+        include_oracle: bool = True,
+        use_feasibility: bool = True,
+        prefix_conditioning: bool = False,
+        prefix_sample_prob: float = 0.5,
+        seed: int = 42,
+    ) -> None:
+        # Local import keeps torch_pipeline importable even if constraints is absent.
+        from src.diplan.constraints import is_feasible, longest_common_prefix_ratio
+
+        rng = random.Random(seed)
+        sep_id = query_vocab.stoi.get(SEP)
+        self.samples: List[Tuple[List[int], List[int], float]] = []
+        self.n_pool = 0
+        self.n_exec_positive = 0
+        self.n_nonexec = 0
+        self.n_kept = 0
+        self.weight_sum = 0.0
+        for row in rows:
+            oracle = list(row.get("oracle_path", []))
+            if not oracle:
+                continue
+            constraints = row.get("constraints", {}) or {}
+            query_tokens = list(row.get("query_tokens", []))
+            state_prefixes = row.get("state_query_tokens_by_prefix") or []
+            meta_by_path = {}
+            for item in row.get("candidate_metadata", []) or []:
+                if isinstance(item, dict) and isinstance(item.get("path"), list):
+                    meta_by_path[tuple(item["path"])] = item
+
+            # Build the deduped candidate pool.
+            pool: List[List[str]] = []
+            seen = set()
+            sources = ([oracle] if include_oracle else []) + [
+                list(c) for c in row.get("candidate_paths", []) if isinstance(c, list)
+            ]
+            if not include_oracle and not sources:
+                sources = [oracle]
+            for cand in sources:
+                key = tuple(cand)
+                if key in seen or not cand:
+                    continue
+                seen.add(key)
+                pool.append(cand)
+            if not pool:
+                continue
+
+            # Returns + feasibility for each pool member.
+            returns: List[float] = []
+            feas: List[bool] = []
+            exec_scores: List[float] = []
+            for cand in pool:
+                self.n_pool += 1
+                meta = meta_by_path.get(tuple(cand), {})
+                explicit_score = meta.get("executable_score", None)
+                exec_score = float(explicit_score) if explicit_score is not None else (1.0 if cand == oracle else 0.0)
+                exec_score = max(0.0, min(1.0, exec_score))
+                if exec_score > 0.0:
+                    self.n_exec_positive += 1
+                else:
+                    self.n_nonexec += 1
+                r = exec_score if explicit_score is not None else (
+                    1.0 if cand == oracle else longest_common_prefix_ratio(cand, oracle)
+                )
+                returns.append(float(r))
+                if use_feasibility:
+                    explicit_ok = meta.get("is_executable", None)
+                    ok = bool(explicit_ok) if explicit_ok is not None else bool(is_feasible(cand, constraints)[0])
+                    feas.append(ok and exec_score > 0.0)
+                else:
+                    feas.append(True)
+                exec_scores.append(exec_score)
+
+            # Per-row min-max normalisation of returns -> decision weights.
+            lo, hi = min(returns), max(returns)
+            span = (hi - lo) if (hi - lo) > 1e-6 else 1.0
+            for cand, r, ok, exec_score in zip(pool, returns, feas, exec_scores):
+                if not ok:
+                    continue
+                r_norm = (r - lo) / span
+                # Executable score directly gates/weights the diffusion MSE.
+                # This keeps diffusion focused on actionable futures instead of
+                # cloning high-LCP but non-completing near misses.
+                w = max(1e-4, exec_score) * math.exp(float(alpha) * r_norm)
+                path_ids = path_vocab.encode(cand, add_bos_eos=True, max_len=max_path_len)
+                if len(path_ids) < 3:
+                    continue
+
+                if prefix_conditioning and sep_id is not None:
+                    # Sample a commit-prefix cut over this plan; bias toward k=0.
+                    if rng.random() < prefix_sample_prob and len(cand) > 1:
+                        k = rng.randrange(1, len(cand))
+                    else:
+                        k = 0
+                    if k < len(state_prefixes):
+                        cond_base = list(state_prefixes[k])
+                    else:
+                        cond_base = query_tokens
+                    cond_tokens = cond_base + ([SEP] + cand[:k] if k > 0 else [])
+                else:
+                    cond_tokens = list(state_prefixes[0]) if state_prefixes else query_tokens
+                query_ids = query_vocab.encode(cond_tokens, add_bos_eos=False, max_len=max_query_len)
+                if not query_ids:
+                    continue
+                self.samples.append((path_ids, query_ids, float(w)))
+                self.n_kept += 1
+                self.weight_sum += float(w)
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def __getitem__(self, idx: int) -> Tuple[List[int], List[int], float]:
         return self.samples[idx]
 
 
@@ -120,7 +261,9 @@ class ValueDataset(Dataset):
         all_rel = sorted(list({r for row in rows for r in row["oracle_path"]}))
         self.samples = []
         for row in rows:
-            q = query_vocab.encode(row["query_tokens"], add_bos_eos=False, max_len=max_query_len)
+            state_prefixes = row.get("state_query_tokens_by_prefix") or []
+            q_tokens = list(state_prefixes[0]) if state_prefixes else row["query_tokens"]
+            q = query_vocab.encode(q_tokens, add_bos_eos=False, max_len=max_query_len)
             pos = path_vocab.encode(row["oracle_path"], add_bos_eos=False, max_len=max_path_len)
             if not q or not pos:
                 continue
@@ -421,6 +564,16 @@ class ValueRanker(nn.Module):
         return self.mlp(x).squeeze(1)
 
 
+class ConstraintModel(ValueRanker):
+    """Learned constraint model C_xi (paper §5.3/§7.3.3).
+
+    Architecturally identical to :class:`ValueRanker` (maps ``(q_ids, p_ids)`` to a
+    scalar logit); trained with BCE where the target is ``1{infeasible}`` so
+    ``sigmoid(forward(...))`` approximates ``P(violation)``. Kept as a distinct class
+    purely for clarity at the call sites.
+    """
+
+
 def collate_autoencoder(batch: List[List[int]], pad_id: int) -> Tuple[torch.Tensor, torch.Tensor]:
     x, lens = pad_2d(batch, pad_id)
     return x, lens
@@ -434,6 +587,17 @@ def collate_diffusion(batch: List[Tuple[List[int], List[int]]], p_pad: int, q_pa
     return p_ids, p_lens, q_ids, q_lens
 
 
+def collate_weighted_diffusion(
+    batch: List[Tuple[List[int], List[int], float]], p_pad: int, q_pad: int
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    p = [x[0] for x in batch]
+    q = [x[1] for x in batch]
+    w = torch.tensor([x[2] for x in batch], dtype=torch.float32)
+    p_ids, p_lens = pad_2d(p, p_pad)
+    q_ids, q_lens = pad_2d(q, q_pad)
+    return p_ids, p_lens, q_ids, q_lens, w
+
+
 def collate_value(batch: List[Tuple[List[int], List[int], float]], q_pad: int, p_pad: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     q = [x[0] for x in batch]
     p = [x[1] for x in batch]
@@ -443,9 +607,49 @@ def collate_value(batch: List[Tuple[List[int], List[int], float]], q_pad: int, p
     return q_ids, p_ids, y
 
 
-def build_vocabs(rows: List[Dict], min_freq: int = 1) -> Tuple[SimpleVocab, SimpleVocab]:
+def build_vocabs(
+    rows: List[Dict], min_freq: int = 1, prefix_conditioning: bool = False
+) -> Tuple[SimpleVocab, SimpleVocab]:
     path_vocab = SimpleVocab.build((r["oracle_path"] for r in rows), min_freq=min_freq)
-    query_vocab = SimpleVocab.build((r["query_tokens"] for r in rows), min_freq=min_freq)
+    if prefix_conditioning:
+        # Union the query vocab with plan tokens + SEP so an executed prefix can be
+        # packed into the planner condition stream (paper §5.1/§5.5).
+        def _cond_streams():
+            for r in rows:
+                yield list(r.get("query_tokens", [])) + [SEP] + list(r.get("oracle_path", []))
+
+        query_vocab = SimpleVocab.build(_cond_streams(), min_freq=min_freq)
+    else:
+        query_vocab = SimpleVocab.build((r["query_tokens"] for r in rows), min_freq=min_freq)
+    return path_vocab, query_vocab
+
+
+def build_vocabs(
+    rows: List[Dict], min_freq: int = 1, prefix_conditioning: bool = False
+) -> Tuple[SimpleVocab, SimpleVocab]:
+    """Build path/query vocabularies, including optional symbolic state tokens.
+
+    This definition intentionally overrides the legacy one above so existing
+    callers get state-aware vocab construction without changing imports.
+    """
+    path_vocab = SimpleVocab.build((r["oracle_path"] for r in rows), min_freq=min_freq)
+    if prefix_conditioning:
+        def _cond_streams():
+            for r in rows:
+                oracle = list(r.get("oracle_path", []))
+                yield list(r.get("query_tokens", [])) + [SEP] + oracle
+                for state_tokens in r.get("state_query_tokens_by_prefix", []) or []:
+                    yield list(state_tokens) + [SEP] + oracle
+
+        query_vocab = SimpleVocab.build(_cond_streams(), min_freq=min_freq)
+    else:
+        def _query_streams():
+            for r in rows:
+                yield list(r.get("query_tokens", []))
+                for state_tokens in r.get("state_query_tokens_by_prefix", []) or []:
+                    yield list(state_tokens)
+
+        query_vocab = SimpleVocab.build(_query_streams(), min_freq=min_freq)
     return path_vocab, query_vocab
 
 

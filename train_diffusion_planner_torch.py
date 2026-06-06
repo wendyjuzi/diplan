@@ -12,7 +12,9 @@ from src.diplan.torch_pipeline import (
     DiffusionPlanner,
     PAD,
     PathAutoencoder,
+    WeightedDiffusionDataset,
     collate_diffusion,
+    collate_weighted_diffusion,
     linear_beta_schedule,
     load_vocab,
     q_sample,
@@ -29,7 +31,9 @@ def _compute_latent_stats(
     sum_z = None
     sum_sq = None
     n = 0
-    for p_ids, p_lens, _q_ids, _q_lens in loader:
+    for batch in loader:
+        # Works for both collate_diffusion (4-tuple) and collate_weighted_diffusion (5-tuple).
+        p_ids, p_lens = batch[0], batch[1]
         p_ids = p_ids.to(device)
         p_lens = p_lens.to(device)
         z = ae.encode(p_ids, p_lens).detach().cpu()
@@ -64,24 +68,62 @@ def main() -> None:
     pad_p = path_vocab.stoi[PAD]
     pad_q = query_vocab.stoi[PAD]
 
-    dataset = DiffusionDataset(
-        rows=rows,
-        path_vocab=path_vocab,
-        query_vocab=query_vocab,
-        max_path_len=int(cfg.get("max_path_len", 8)),
-        max_query_len=int(cfg.get("max_query_len", 24)),
-    )
+    # Decision-weighted diffusion (paper §7.3.2) and/or prefix-conditioned planning
+    # state (paper §5.1/§5.5) are opt-in via config; when both are off this falls
+    # back to the original plain DiffusionDataset so existing runs are unchanged.
+    decision_weighting = bool(cfg.get("decision_weighting", False))
+    prefix_conditioning = bool(cfg.get("prefix_conditioning", False))
+    weighted = decision_weighting or prefix_conditioning
+    if weighted:
+        dataset = WeightedDiffusionDataset(
+            rows=rows,
+            path_vocab=path_vocab,
+            query_vocab=query_vocab,
+            max_path_len=int(cfg.get("max_path_len", 8)),
+            max_query_len=int(cfg.get("max_query_len", 24)),
+            alpha=float(cfg.get("decision_weight_alpha", 1.0)) if decision_weighting else 0.0,
+            include_oracle=bool(cfg.get("include_oracle", True)),
+            use_feasibility=bool(cfg.get("decision_use_feasibility", True)),
+            prefix_conditioning=prefix_conditioning,
+            prefix_sample_prob=float(cfg.get("prefix_sample_prob", 0.5)),
+            seed=int(cfg.get("seed", 42)),
+        )
+        collate = lambda b: collate_weighted_diffusion(b, pad_p, pad_q)
+        print(
+            f"[planner] decision_weighting={decision_weighting} "
+            f"alpha={cfg.get('decision_weight_alpha', 1.0)} "
+            f"prefix_conditioning={prefix_conditioning} samples={len(dataset)}"
+        )
+        if hasattr(dataset, "n_pool"):
+            avg_w = float(getattr(dataset, "weight_sum", 0.0)) / max(1, int(getattr(dataset, "n_kept", 0)))
+            print(
+                "[planner] executable supervision "
+                f"pool={getattr(dataset, 'n_pool', 0)} "
+                f"exec_pos={getattr(dataset, 'n_exec_positive', 0)} "
+                f"nonexec={getattr(dataset, 'n_nonexec', 0)} "
+                f"kept_for_diffusion={getattr(dataset, 'n_kept', 0)} "
+                f"avg_weight={avg_w:.4f}"
+            )
+    else:
+        dataset = DiffusionDataset(
+            rows=rows,
+            path_vocab=path_vocab,
+            query_vocab=query_vocab,
+            max_path_len=int(cfg.get("max_path_len", 8)),
+            max_query_len=int(cfg.get("max_query_len", 24)),
+        )
+        collate = lambda b: collate_diffusion(b, pad_p, pad_q)
     loader = DataLoader(
         dataset,
         batch_size=int(cfg.get("batch_size", 64)),
         shuffle=True,
-        collate_fn=lambda b: collate_diffusion(b, pad_p, pad_q),
+        collate_fn=collate,
     )
     stats_loader = DataLoader(
         dataset,
         batch_size=int(cfg.get("batch_size", 64)),
         shuffle=False,
-        collate_fn=lambda b: collate_diffusion(b, pad_p, pad_q),
+        collate_fn=collate,
     )
 
     device = torch.device("cuda" if torch.cuda.is_available() and bool(cfg.get("use_cuda", False)) else "cpu")
@@ -138,10 +180,14 @@ def main() -> None:
         total_mse_z0 = 0.0
         total_cos_z0 = 0.0
         count = 0
-        for p_ids, p_lens, q_ids, _q_lens in loader:
+        for batch in loader:
+            p_ids, p_lens, q_ids = batch[0], batch[1], batch[2]
+            w = batch[4] if (weighted and len(batch) >= 5) else None
             p_ids = p_ids.to(device)
             p_lens = p_lens.to(device)
             q_ids = q_ids.to(device)
+            if w is not None:
+                w = w.to(device)
             with torch.no_grad():
                 z0_raw = ae.encode(p_ids, p_lens)
                 z0 = (z0_raw - latent_mean) / latent_std
@@ -153,11 +199,17 @@ def main() -> None:
             a_t = alpha_bars[t_idx].unsqueeze(1)
             if prediction_target == "z0":
                 z0_hat = model_out
-                loss = F.mse_loss(z0_hat, z0)
             else:
                 eps_hat = model_out
-                loss = F.mse_loss(eps_hat, noise)
                 z0_hat = (z_t - (1.0 - a_t).sqrt() * eps_hat) / a_t.sqrt().clamp(min=1e-6)
+            # Per-sample MSE, decision-weighted per paper §7.3.2 when weights present.
+            pred_for_loss = z0_hat if prediction_target == "z0" else eps_hat
+            target_for_loss = z0 if prediction_target == "z0" else noise
+            if w is not None:
+                per = ((pred_for_loss - target_for_loss) ** 2).mean(dim=1)
+                loss = (w * per).sum() / w.sum().clamp(min=1e-6)
+            else:
+                loss = F.mse_loss(pred_for_loss, target_for_loss)
             mse_z0 = F.mse_loss(z0_hat, z0)
             cos_z0 = F.cosine_similarity(z0_hat, z0, dim=1).mean()
             opt.zero_grad()
@@ -198,6 +250,9 @@ def main() -> None:
             "time_dim": int(cfg.get("time_dim", 32)),
             "diffusion_steps": steps,
             "prediction_target": prediction_target,
+            "prefix_conditioning": prefix_conditioning,
+            "decision_weighting": decision_weighting,
+            "max_query_len": int(cfg.get("max_query_len", 24)),
         },
         "query_vocab": ae_ckpt["query_vocab"],
         "path_vocab": ae_ckpt["path_vocab"],

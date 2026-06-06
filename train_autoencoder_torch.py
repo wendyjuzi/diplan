@@ -29,7 +29,14 @@ def main() -> None:
     set_seed(int(cfg.get("seed", 42)))
     rows = load_jsonl(cfg["train_path"])
 
-    path_vocab, query_vocab = build_vocabs(rows, min_freq=int(cfg.get("min_freq", 1)))
+    # When prefix conditioning is enabled (paper §5.1/§5.5) the query/condition vocab
+    # is unioned with plan tokens + <sep> so an executed prefix can be packed into the
+    # planner condition. AE, planner and value models all share this vocab.
+    path_vocab, query_vocab = build_vocabs(
+        rows,
+        min_freq=int(cfg.get("min_freq", 1)),
+        prefix_conditioning=bool(cfg.get("prefix_conditioning", False)),
+    )
     dataset = AutoencoderDataset(
         rows=rows,
         path_vocab=path_vocab,

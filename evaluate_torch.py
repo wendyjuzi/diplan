@@ -7,6 +7,11 @@ from typing import Dict, List, Tuple
 import torch
 
 from src.diplan.io_utils import dump_json, dump_jsonl, ensure_dir, load_config, load_jsonl
+from src.diplan.constraints import (
+    is_feasible as _is_feasible,
+    project_path_to_valid,
+    valid_relations_from_row,
+)
 from src.diplan.failure_memory import build_failure_memory
 from src.diplan.metrics import (
     aggregate_method_metrics,
@@ -20,6 +25,8 @@ from src.diplan.tool_decoder import path_to_tool_calls
 from src.diplan.torch_pipeline import (
     EOS,
     PAD,
+    SEP,
+    ConstraintModel,
     DiffusionPlanner,
     MLPPlanner,
     PathAutoencoder,
@@ -119,93 +126,6 @@ def _filter_feasible_candidates(candidates: List[List[str]], constraints: Dict) 
         else:
             dropped += 1
     return kept, dropped
-
-
-def _is_feasible(path: List[str], constraints: Dict) -> Tuple[bool, List[str]]:
-    violations = []
-    if len(path) > int(constraints.get("max_steps", 8)):
-        violations.append("max_steps_exceeded")
-    banned = set(constraints.get("banned_relations", []))
-    for rel in path:
-        if rel in banned:
-            violations.append("banned_relation")
-
-    def _action_stage(token: str) -> str:
-        if not isinstance(token, str):
-            return ""
-        if "::" in token:
-            return token.split("::", 1)[0].strip().upper()
-        if "(" in token:
-            return token.split("(", 1)[0].strip().upper()
-        if "_" in token:
-            return token.split("_", 1)[0].strip().upper()
-        return token.strip().upper()
-
-    def _matches(token: str, pattern: str) -> bool:
-        t = str(token).strip().upper()
-        p = str(pattern).strip().upper()
-        if not p:
-            return False
-        return t == p or t.startswith(p) or _action_stage(t) == p
-
-    # Generic forbidden action constraints (supports exact/prefix/stage-level patterns).
-    forbidden_actions = constraints.get("forbidden_actions", [])
-    if isinstance(forbidden_actions, list):
-        for a in path:
-            for ptn in forbidden_actions:
-                if _matches(a, str(ptn)):
-                    violations.append("forbidden_action")
-                    break
-
-    # Stage order constraints for long-horizon tasks (e.g., clinical workflow).
-    required_stage_order = constraints.get("required_stage_order", [])
-    if isinstance(required_stage_order, list) and required_stage_order:
-        order_idx = {str(s).strip().upper(): i for i, s in enumerate(required_stage_order)}
-        last = -1
-        for a in path:
-            st = _action_stage(a)
-            if st in order_idx:
-                cur = order_idx[st]
-                if cur < last:
-                    violations.append("stage_order_violation")
-                    break
-                last = cur
-
-    # Pairwise precedence constraints: first must happen before second (if second appears).
-    must_precede = constraints.get("must_precede", [])
-    if isinstance(must_precede, list):
-        for rule in must_precede:
-            if not isinstance(rule, dict):
-                continue
-            first = str(rule.get("first", "")).strip()
-            second = str(rule.get("second", "")).strip()
-            if not first or not second:
-                continue
-            first_pos = [i for i, a in enumerate(path) if _matches(a, first)]
-            second_pos = [i for i, a in enumerate(path) if _matches(a, second)]
-            if second_pos:
-                if (not first_pos) or (min(second_pos) < min(first_pos)):
-                    violations.append("precedence_violation")
-                    break
-
-    # For a target action, prerequisite actions must already exist before it.
-    required_before = constraints.get("required_before", {})
-    if isinstance(required_before, dict):
-        for tgt, prereqs in required_before.items():
-            if not isinstance(prereqs, list):
-                continue
-            tgt_pos = [i for i, a in enumerate(path) if _matches(a, str(tgt))]
-            if not tgt_pos:
-                continue
-            first_tgt = min(tgt_pos)
-            for pre in prereqs:
-                pre_pos = [i for i, a in enumerate(path) if _matches(a, str(pre))]
-                if (not pre_pos) or (min(pre_pos) > first_tgt):
-                    violations.append("prerequisite_missing")
-                    break
-            if "prerequisite_missing" in violations:
-                break
-    return len(violations) == 0, sorted(set(violations))
 
 
 def _first_feasible_memory_idx(
@@ -501,8 +421,18 @@ def _generate_candidates(
     value_guidance_temperature: float = 0.5,
     expected_len: float | None = None,
     length_penalty_alpha: float = 0.0,
+    executed_prefix: List[str] | None = None,
+    prefix_conditioning: bool = False,
+    cond_max_len: int = 24,
+    valid_rels: set | None = None,
+    feasibility_projection: bool = False,
 ) -> Tuple[List[List[str]], float]:
-    q_ids = query_vocab.encode(query_tokens, add_bos_eos=False, max_len=24)
+    # Prefix-conditioned planning state (paper §5.1/§5.5): pack the executed prefix
+    # into the condition stream so receding-horizon re-planning is state-aware.
+    cond_tokens = list(query_tokens)
+    if prefix_conditioning and executed_prefix:
+        cond_tokens = cond_tokens + [SEP] + list(executed_prefix)
+    q_ids = query_vocab.encode(cond_tokens, add_bos_eos=False, max_len=cond_max_len)
     if not q_ids:
         q_ids = [query_vocab.stoi[PAD]]
     q_batch = torch.tensor([q_ids for _ in range(num_candidates)], dtype=torch.long, device=device)
@@ -544,6 +474,9 @@ def _generate_candidates(
     if latent_mean is not None and latent_std is not None:
         z = z * latent_std + latent_mean
     cands = _decode_latents_to_paths(autoencoder, path_vocab, z, max_path_len)
+    # Feasibility projection (paper §5.4): snap out-of-set tokens to valid relations.
+    if feasibility_projection and valid_rels:
+        cands = [project_path_to_valid(c, valid_rels) for c in cands]
     uniq = len({tuple(x) for x in cands}) / max(1, len(cands))
     return cands, float(uniq)
 
@@ -577,6 +510,32 @@ def _score_candidates(
     if length_penalty_alpha > 0.0:
         scores = [s - length_penalty_alpha * abs(len(c) - expected) for s, c in zip(scores, candidates)]
     return scores
+
+
+@torch.no_grad()
+def _constraint_violation_scores(
+    constraint_model: ConstraintModel | None,
+    path_vocab,
+    query_vocab,
+    query_tokens: List[str],
+    candidates: List[List[str]],
+    device: torch.device,
+) -> List[float]:
+    """Learned P(violation) in [0,1] per candidate (paper §5.3/§7.3.3)."""
+    if constraint_model is None or not candidates:
+        return [0.0 for _ in candidates]
+    q = query_vocab.encode(query_tokens, add_bos_eos=False, max_len=24)
+    if not q:
+        q = [query_vocab.stoi[PAD]]
+    rows = []
+    for c in candidates:
+        p = path_vocab.encode(c, add_bos_eos=False, max_len=8)
+        if not p:
+            p = [path_vocab.stoi[PAD]]
+        rows.append((q, p, 0.0))
+    q_ids, p_ids, _ = collate_value(rows, query_vocab.stoi[PAD], path_vocab.stoi[PAD])
+    logits = constraint_model(q_ids.to(device), p_ids.to(device))
+    return torch.sigmoid(logits).detach().cpu().tolist()
 
 
 @torch.no_grad()
@@ -659,9 +618,16 @@ def _predict_diplan(
     disable_generated_candidates: bool,
     save_candidate_pool_topk: int,
     save_episode_trace: bool,
+    constraint_model: ConstraintModel | None = None,
+    constraint_penalty_weight: float = 0.0,
+    prefix_conditioning: bool = False,
+    cond_max_len: int = 24,
+    feasibility_projection: bool = False,
 ) -> Dict:
     max_steps = int(row["constraints"].get("max_steps", 8))
     query_tokens = row["query_tokens"]
+    # Per-task valid relation set for feasibility projection (paper §5.4).
+    valid_rels = valid_relations_from_row(row) if feasibility_projection else None
     all_candidates = []
     pool_seen = set()
     all_violations: List[str] = []
@@ -697,6 +663,11 @@ def _predict_diplan(
                     value_guidance_temperature=value_guidance_temperature,
                     expected_len=expected_total_len,
                     length_penalty_alpha=length_penalty_alpha,
+                    executed_prefix=None,
+                    prefix_conditioning=prefix_conditioning,
+                    cond_max_len=cond_max_len,
+                    valid_rels=valid_rels,
+                    feasibility_projection=feasibility_projection,
                 )
                 generated_all.extend(c_gen)
         generated_unique, generated_counts = _dedupe_with_count(generated_all)
@@ -759,6 +730,13 @@ def _predict_diplan(
                 s - failure_penalty * float(failure_weights.get(c[0], 0.0) if c else 0.0)
                 for s, c in zip(scores, cands)
             ]
+        # Learned constraint penalty (paper §5.3/§7.3.3): down-rank likely-infeasible
+        # plans. Complements the hard _is_feasible gate applied during selection.
+        if constraint_model is not None and constraint_penalty_weight > 0.0:
+            viol = _constraint_violation_scores(
+                constraint_model, path_vocab, query_vocab, query_tokens, cands, device
+            )
+            scores = [s - constraint_penalty_weight * v for s, v in zip(scores, viol)]
         all_candidates.extend(cands)
         idx_sorted = sorted(range(len(cands)), key=lambda i: scores[i], reverse=True)
         best = idx_sorted[0]
@@ -883,6 +861,11 @@ def _predict_diplan(
                     value_guidance_temperature=value_guidance_temperature,
                     expected_len=expected_remaining,
                     length_penalty_alpha=length_penalty_alpha,
+                    executed_prefix=list(executed),
+                    prefix_conditioning=prefix_conditioning,
+                    cond_max_len=cond_max_len,
+                    valid_rels=valid_rels,
+                    feasibility_projection=feasibility_projection,
                 )
                 generated_all.extend(c_gen)
         generated_unique, generated_counts = _dedupe_with_count(generated_all)
@@ -927,6 +910,13 @@ def _predict_diplan(
                 s - failure_penalty * float(failure_weights.get(c[0], 0.0) if c else 0.0)
                 for s, c in zip(scores, cands)
             ]
+        # Learned constraint penalty (paper §5.3/§7.3.3): down-rank likely-infeasible
+        # plans. Complements the hard _is_feasible gate applied during selection.
+        if constraint_model is not None and constraint_penalty_weight > 0.0:
+            viol = _constraint_violation_scores(
+                constraint_model, path_vocab, query_vocab, query_tokens, cands, device
+            )
+            scores = [s - constraint_penalty_weight * v for s, v in zip(scores, viol)]
         all_candidates.extend(cands)
         uniq_vals.append(uniq)
         idx_sorted = sorted(range(len(cands)), key=lambda i: scores[i], reverse=True)
@@ -1056,6 +1046,7 @@ def main() -> None:
     parser.add_argument("--ae_ckpt", type=str, required=True)
     parser.add_argument("--planner_ckpt", type=str, required=True)
     parser.add_argument("--value_ckpt", type=str, default="")
+    parser.add_argument("--constraint_ckpt", type=str, default="")
     parser.add_argument("--out", type=str, default="results/main_torch")
     args = parser.parse_args()
 
@@ -1159,6 +1150,41 @@ def main() -> None:
         ).to(device)
         value_model.load_state_dict(value_ckpt["model_state"])
         value_model.eval()
+
+    # Learned constraint model C_xi (paper §5.3/§7.3.3), optional.
+    constraint_model = None
+    use_constraint_model = bool(cfg.get("use_constraint_model", False))
+    constraint_penalty_weight = float(cfg.get("constraint_penalty_weight", 0.0))
+    if use_constraint_model:
+        if not args.constraint_ckpt:
+            raise ValueError("use_constraint_model=true requires --constraint_ckpt")
+        constraint_ckpt = torch.load(args.constraint_ckpt, map_location="cpu")
+        c_cfg = constraint_ckpt["model_config"]
+        constraint_model = ConstraintModel(
+            q_vocab_size=c_cfg["q_vocab_size"],
+            p_vocab_size=c_cfg["p_vocab_size"],
+            emb_dim=c_cfg["emb_dim"],
+            q_pad_id=c_cfg["q_pad_id"],
+            p_pad_id=c_cfg["p_pad_id"],
+            architecture=str(c_cfg.get("architecture", "cross")),
+            hidden_dim=int(c_cfg.get("hidden_dim", 256)),
+            dropout=float(c_cfg.get("dropout", 0.1)),
+        ).to(device)
+        constraint_model.load_state_dict(constraint_ckpt["model_state"])
+        constraint_model.eval()
+        print(f"[eval] constraint model enabled, penalty_weight={constraint_penalty_weight:.3f}")
+
+    # Prefix-conditioned planning state (paper §5.1/§5.5) + feasibility projection (§5.4).
+    prefix_conditioning = bool(cfg.get("prefix_conditioning", bool(pl_cfg.get("prefix_conditioning", False))))
+    cond_max_len = int(cfg.get("cond_max_len", pl_cfg.get("max_query_len", 24)))
+    feasibility_projection = bool(cfg.get("feasibility_projection_enabled", False))
+    if prefix_conditioning:
+        if SEP not in query_vocab.stoi:
+            print("[eval] WARNING: prefix_conditioning enabled but <sep> not in query vocab; prefix will be ignored.")
+        else:
+            print(f"[eval] prefix_conditioning enabled, cond_max_len={cond_max_len}")
+    if feasibility_projection:
+        print("[eval] feasibility_projection enabled (paper §5.4)")
 
     use_memory_retrieval = bool(cfg.get("use_memory_retrieval", False))
     memory_prefilter_feasible = bool(cfg.get("memory_prefilter_feasible", True))
@@ -1321,6 +1347,11 @@ def main() -> None:
             disable_generated_candidates=disable_generated_candidates,
             save_candidate_pool_topk=save_candidate_pool_topk,
             save_episode_trace=save_episode_trace,
+            constraint_model=constraint_model,
+            constraint_penalty_weight=constraint_penalty_weight,
+            prefix_conditioning=prefix_conditioning,
+            cond_max_len=cond_max_len,
+            feasibility_projection=feasibility_projection,
         )
         executed = pred["executed_path"]
         feasible, violations = _is_feasible(executed, row["constraints"])
