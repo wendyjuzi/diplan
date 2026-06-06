@@ -24,6 +24,7 @@ if str(ROOT) not in sys.path:
 sys.path.insert(0, str(ROOT / "scripts"))
 
 from collect_alfworld_trajectories import _build_constraints, _candidate_metadata  # noqa: E402
+from run_alfworld_diplan_agent import _parse_goal  # noqa: E402
 
 
 CORE_STAGES = {"TAKE", "PUT", "HEAT", "COOL", "CLEAN", "USE", "EXAMINE"}
@@ -69,6 +70,14 @@ def _recep(tok: str) -> str:
     return ""
 
 
+def _obj(tok: str) -> str:
+    st, payload = _split(tok)
+    parts = [p for p in payload.split("_") if p]
+    if st in OBJECT_RECEP_STAGES and parts:
+        return parts[0]
+    return ""
+
+
 def _append(out: List[str], tok: str) -> None:
     if tok and (not out or out[-1] != tok):
         out.append(tok)
@@ -104,10 +113,41 @@ def _core_stages_for_row(row: Dict[str, Any]) -> set:
     return stages
 
 
+def _goal_spec(row: Dict[str, Any]) -> Dict[str, Any]:
+    spec = row.get("structured_goal", {}) or {}
+    if spec:
+        return spec
+    return _parse_goal(str(row.get("question", "")))
+
+
+def _is_target_core(tok: str, row: Dict[str, Any]) -> bool:
+    st = _stage(tok)
+    spec = _goal_spec(row)
+    target_obj = str(spec.get("target_object", "") or "").lower().replace(" ", "")
+    target_recep = str(spec.get("target_receptacle", "") or "").lower().replace(" ", "")
+    is_look = _is_look_task(row)
+
+    if st in {"TAKE", "PUT", "HEAT", "COOL", "CLEAN"}:
+        obj = _obj(tok)
+        recep = _recep(tok)
+        if target_obj and obj != target_obj:
+            return False
+        if st == "PUT" and target_recep and recep != target_recep and not is_look:
+            return False
+        return True
+
+    if st in {"USE", "EXAMINE"}:
+        return is_look
+    return False
+
+
 def goal_focused_path(row: Dict[str, Any], keep_initial_look: bool = False) -> List[str]:
     path = list(row.get("oracle_path", []))
     core_stages = _core_stages_for_row(row)
-    core_indices = [i for i, tok in enumerate(path) if _stage(tok) in core_stages]
+    core_indices = [
+        i for i, tok in enumerate(path)
+        if _stage(tok) in core_stages and _is_target_core(tok, row)
+    ]
     if not core_indices:
         return list(path)
 
