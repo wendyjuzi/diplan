@@ -29,6 +29,32 @@ from run_alfworld_diplan_agent import _parse_goal  # noqa: E402
 
 CORE_STAGES = {"TAKE", "PUT", "HEAT", "COOL", "CLEAN", "USE", "EXAMINE"}
 OBJECT_RECEP_STAGES = {"TAKE", "PUT", "HEAT", "COOL", "CLEAN"}
+GOAL_NOISE_WORDS = {
+    "a",
+    "an",
+    "and",
+    "at",
+    "find",
+    "in",
+    "it",
+    "look",
+    "on",
+    "put",
+    "some",
+    "the",
+    "them",
+    "to",
+    "two",
+    "with",
+    "heat",
+    "hot",
+    "cool",
+    "cold",
+    "clean",
+    "examine",
+    "under",
+    "desklamp",
+}
 
 
 def _load_jsonl(path: Path) -> List[Dict[str, Any]]:
@@ -115,9 +141,23 @@ def _core_stages_for_row(row: Dict[str, Any]) -> set:
 
 def _goal_spec(row: Dict[str, Any]) -> Dict[str, Any]:
     spec = row.get("structured_goal", {}) or {}
-    if spec:
-        return spec
-    return _parse_goal(str(row.get("question", "")))
+    if not spec:
+        spec = _parse_goal(str(row.get("question", "")))
+    spec = dict(spec)
+    question = str(row.get("question", "") or spec.get("goal", "")).lower()
+    words = [w.strip(".,!?;:").replace(" ", "") for w in question.split()]
+    content = [w for w in words if w and w not in GOAL_NOISE_WORDS]
+    obj = str(spec.get("target_object", "") or "").lower().replace(" ", "")
+    recep = str(spec.get("target_receptacle", "") or "").lower().replace(" ", "")
+    # The generic parser may treat "two/find/them" as the object in two-object
+    # ALFWorld goals. Repair it locally for distillation.
+    if (not obj or obj in GOAL_NOISE_WORDS) and content:
+        obj = content[0]
+    if (not recep or recep == obj or recep in GOAL_NOISE_WORDS) and len(content) >= 2:
+        recep = content[-1]
+    spec["target_object"] = obj
+    spec["target_receptacle"] = recep
+    return spec
 
 
 def _is_target_core(tok: str, row: Dict[str, Any]) -> bool:
