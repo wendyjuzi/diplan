@@ -90,8 +90,24 @@ def _opened_relevant_recep(path: List[str], start: int, idx: int, recep: str) ->
     return False
 
 
-def goal_focused_path(path: List[str], keep_initial_look: bool = False) -> List[str]:
-    core_indices = [i for i, tok in enumerate(path) if _stage(tok) in CORE_STAGES]
+def _is_look_task(row: Dict[str, Any]) -> bool:
+    meta = row.get("meta", {}) or {}
+    transform = str(meta.get("transform", "") or "").lower()
+    question = str(row.get("question", "") or "").lower()
+    return transform == "look" or "look at" in question or "examine" in question
+
+
+def _core_stages_for_row(row: Dict[str, Any]) -> set:
+    stages = {"TAKE", "PUT", "HEAT", "COOL", "CLEAN"}
+    if _is_look_task(row):
+        stages.update({"USE", "EXAMINE"})
+    return stages
+
+
+def goal_focused_path(row: Dict[str, Any], keep_initial_look: bool = False) -> List[str]:
+    path = list(row.get("oracle_path", []))
+    core_stages = _core_stages_for_row(row)
+    core_indices = [i for i, tok in enumerate(path) if _stage(tok) in core_stages]
     if not core_indices:
         return list(path)
 
@@ -124,7 +140,7 @@ def goal_focused_path(path: List[str], keep_initial_look: bool = False) -> List[
 
 def _focus_row(row: Dict[str, Any], keep_initial_look: bool) -> Tuple[Dict[str, Any], Dict[str, float]]:
     old_path = list(row.get("oracle_path", []))
-    new_path = goal_focused_path(old_path, keep_initial_look=keep_initial_look)
+    new_path = goal_focused_path(row, keep_initial_look=keep_initial_look)
     new_row = dict(row)
     new_row["oracle_path"] = new_path
     # Raw commands/state prefixes are no longer position-aligned after
