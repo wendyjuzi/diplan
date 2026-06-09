@@ -75,6 +75,7 @@ def run_llm(prompt, temperature, max_tokens, opeani_api_keys, engine="gpt-3.5-tu
         ],
         "temperature": temperature,
         "max_tokens": max_tokens,
+        "seed": int(os.environ.get("TOG_SEED", "42")),
     }
     data = json.dumps(payload).encode("utf-8")
     headers = {"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"}
@@ -315,6 +316,7 @@ class DiPLaNReranker:
         })
         self.value_weight = float(args.diplan_value_weight)
         self.prior_weight = float(args.diplan_prior_weight)
+        self.score_mode = str(args.diplan_score_mode)
         self.first_step_bonus = float(args.diplan_first_step_bonus)
         self.future_step_bonus = float(args.diplan_future_step_bonus)
         self.prior_min_jaccard = float(args.diplan_prior_min_jaccard)
@@ -385,13 +387,19 @@ class DiPLaNReranker:
         out = []
         for c, v, p in zip(candidates, value_scores, prior_scores):
             cc = dict(c)
+            base = float(cc["score"])
             cc["diplan_value_score"] = float(v)
             cc["diplan_prior_score"] = float(p)
-            cc["score"] = (
-                float(cc["score"])
-                + self.value_weight * float(v)
-                + self.prior_weight * float(p)
-            )
+            if self.score_mode == "tog_only":
+                cc["score"] = base
+            elif self.score_mode == "value_only":
+                cc["score"] = float(v) + 1e-4 * base
+            elif self.score_mode == "prior_only":
+                cc["score"] = float(p) + 1e-4 * base
+            elif self.score_mode == "prior_value":
+                cc["score"] = self.value_weight * float(v) + self.prior_weight * float(p) + 1e-4 * base
+            else:
+                cc["score"] = base + self.value_weight * float(v) + self.prior_weight * float(p)
             out.append(cc)
         out = sorted(out, key=lambda x: x["score"], reverse=True)
         if out and out[0]["relation"] != original_top:
@@ -414,6 +422,7 @@ class DiPLaNReranker:
             "diplan_enabled": self.enabled,
             "diplan_planner_type": getattr(self, "planner_type", "disabled"),
             "diplan_projection_mode": getattr(self, "projection_mode", "disabled"),
+            "diplan_score_mode": getattr(self, "score_mode", "disabled"),
             "diplan_rerank_calls": self.calls,
             "diplan_avg_candidates_per_call": self.candidate_count_sum / denom,
             "diplan_top_changed_rate": self.top_changed / denom,
@@ -751,7 +760,8 @@ def relation_first_select(
         best_entity = max(items, key=lambda x: (x["entity_score"], x["relation_score"]))
         selected.append(best_entity)
     selected.sort(key=lambda x: (x["relation_score"], x["entity_score"]), reverse=True)
-    selected = selected[: max(1, int(args.num_retain_entity))]
+    relation_first_k = int(args.relation_first_k or args.num_retain_entity)
+    selected = selected[: max(1, relation_first_k)]
 
     chain_of_entities = [x["candidate"] for x in selected]
     entities_id = [x["entity_id"] for x in selected]
@@ -804,6 +814,7 @@ def _print_trace(task_no, trace_record, topk):
         print(
             f"    selected_relations={step.get('selected_relations')} "
             f"oracle_selected={step.get('oracle_selected')} "
+            f"oracle_executed_top1={step.get('oracle_executed_top1')} "
             f"selected_entities={step.get('selected_entities')} reached={step.get('answer_reached')}",
             flush=True,
         )
@@ -814,6 +825,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--subgraph_jsonl", required=True)
     parser.add_argument("--out", required=True)
+    parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--max_tasks", type=int, default=20)
     parser.add_argument("--max_length", type=int, default=256)
     parser.add_argument("--max_prompt_relations", type=int, default=64)
@@ -828,12 +840,19 @@ def main():
     parser.add_argument("--prune_tools", type=str, default="llm")
     parser.add_argument("--planning_strategy", type=str, default="tog_diplan", choices=["tog", "tog_diplan"])
     parser.add_argument("--selection_mode", type=str, default="entity_prune", choices=["entity_prune", "relation_first"])
+    parser.add_argument("--relation_first_k", type=int, default=0)
     parser.add_argument("--diplan_repo", default="/root/autodl-tmp/DiPLaN")
     parser.add_argument("--diplan_ae_ckpt", default="")
     parser.add_argument("--diplan_planner_ckpt", default="")
     parser.add_argument("--diplan_value_ckpt", default="")
     parser.add_argument("--diplan_value_weight", type=float, default=1.0)
     parser.add_argument("--diplan_prior_weight", type=float, default=1.0)
+    parser.add_argument(
+        "--diplan_score_mode",
+        type=str,
+        default="fused",
+        choices=["tog_only", "value_only", "prior_only", "prior_value", "fused"],
+    )
     parser.add_argument("--diplan_first_step_bonus", type=float, default=1.0)
     parser.add_argument("--diplan_future_step_bonus", type=float, default=0.35)
     parser.add_argument("--diplan_prior_min_jaccard", type=float, default=0.2)
@@ -848,6 +867,20 @@ def main():
     parser.add_argument("--trace_topk", type=int, default=5)
     args = parser.parse_args()
 
+    random.seed(args.seed)
+    try:
+        import numpy as np
+        np.random.seed(args.seed)
+    except Exception:
+        pass
+    try:
+        import torch
+        torch.manual_seed(args.seed)
+    except Exception:
+        pass
+    import os
+    os.environ["TOG_SEED"] = str(args.seed)
+
     rows = _load_jsonl(args.subgraph_jsonl, args.max_tasks)
     reranker = DiPLaNReranker(args) if args.planning_strategy == "tog_diplan" else None
     Path(args.out).mkdir(parents=True, exist_ok=True)
@@ -858,6 +891,15 @@ def main():
     oracle_rank_after_all = []
     oracle_rank_keep_all = []
     oracle_selected_all = []
+    oracle_step_rank_before = []
+    oracle_step_rank_after = []
+    oracle_step_rank_keep = []
+    oracle_decision_steps = 0
+    oracle_pool_hits = 0
+    oracle_after_hits = 0
+    oracle_keep_hits = 0
+    oracle_selected_hits = 0
+    oracle_executed_hits = 0
     with pred_path.open("w", encoding="utf-8") as fout, trace_path.open("w", encoding="utf-8") as ftrace:
         for task_idx, row in enumerate(tqdm(rows), start=1):
             backend = LocalSubgraphBackend(row)
@@ -925,6 +967,34 @@ def main():
                         )
                     current_entity_relations_list.extend(rels)
 
+                step_oracle = _oracle_next_relation(backend, executed)
+                if step_oracle:
+                    oracle_decision_steps += 1
+                    before_ranks = [
+                        x.get("oracle_rank_before_rerank")
+                        for x in step_trace["entity_expansions"]
+                        if x.get("oracle_rank_before_rerank") is not None
+                    ]
+                    after_ranks = [
+                        x.get("oracle_rank_after_rerank_full")
+                        for x in step_trace["entity_expansions"]
+                        if x.get("oracle_rank_after_rerank_full") is not None
+                    ]
+                    keep_ranks = [
+                        x.get("oracle_rank_after_keep")
+                        for x in step_trace["entity_expansions"]
+                        if x.get("oracle_rank_after_keep") is not None
+                    ]
+                    step_trace["oracle_step_rank_before"] = min(before_ranks) if before_ranks else None
+                    step_trace["oracle_step_rank_after"] = min(after_ranks) if after_ranks else None
+                    step_trace["oracle_step_rank_keep"] = min(keep_ranks) if keep_ranks else None
+                    oracle_step_rank_before.append(step_trace["oracle_step_rank_before"])
+                    oracle_step_rank_after.append(step_trace["oracle_step_rank_after"])
+                    oracle_step_rank_keep.append(step_trace["oracle_step_rank_keep"])
+                    oracle_pool_hits += 1 if before_ranks else 0
+                    oracle_after_hits += 1 if after_ranks else 0
+                    oracle_keep_hits += 1 if keep_ranks else 0
+
                 total_candidates, total_scores, total_relations = [], [], []
                 total_entities_id, total_topic_entities, total_head = [], [], []
                 for ent in current_entity_relations_list:
@@ -961,7 +1031,12 @@ def main():
                 step_trace["selected_heads"] = list(pre_heads)
                 step_trace["oracle_next_relation"] = _oracle_next_relation(backend, executed)
                 step_trace["oracle_selected"] = bool(step_trace["oracle_next_relation"] in set(pre_relations))
+                step_trace["oracle_executed_top1"] = bool(
+                    pre_relations and step_trace["oracle_next_relation"] == pre_relations[0]
+                )
                 oracle_selected_all.append(1.0 if step_trace["oracle_selected"] else 0.0)
+                oracle_selected_hits += 1 if step_trace["oracle_selected"] else 0
+                oracle_executed_hits += 1 if step_trace["oracle_executed_top1"] else 0
                 if pre_relations:
                     executed.append(pre_relations[0])
                 cluster_chain_of_entities.append(chain_of_entities)
@@ -997,11 +1072,22 @@ def main():
         "hits@1": mean([1.0 if r["success"] else 0.0 for r in records]) if records else 0.0,
         "trap@1": mean([1.0 if r["trap_at_1"] else 0.0 for r in records]) if records else 0.0,
         "first_error_step": mean([r["first_error_step"] for r in records]) if records else 0.0,
+        "seed": args.seed,
         "selection_mode": args.selection_mode,
+        "relation_first_k": int(args.relation_first_k or args.num_retain_entity),
         "oracle_rank_before_mean": _mean_or_none(oracle_rank_before_all),
         "oracle_rank_after_mean": _mean_or_none(oracle_rank_after_all),
         "oracle_rank_keep_mean": _mean_or_none(oracle_rank_keep_all),
         "oracle_selected_rate": mean(oracle_selected_all) if oracle_selected_all else 0.0,
+        "oracle_decision_steps": oracle_decision_steps,
+        "oracle_in_pool_rate": oracle_pool_hits / max(1, oracle_decision_steps),
+        "oracle_after_rerank_rate": oracle_after_hits / max(1, oracle_decision_steps),
+        "oracle_in_keep_rate": oracle_keep_hits / max(1, oracle_decision_steps),
+        "oracle_selected_step_rate": oracle_selected_hits / max(1, oracle_decision_steps),
+        "oracle_executed_top1_rate": oracle_executed_hits / max(1, oracle_decision_steps),
+        "oracle_step_rank_before_mean": _mean_or_none(oracle_step_rank_before),
+        "oracle_step_rank_after_mean": _mean_or_none(oracle_step_rank_after),
+        "oracle_step_rank_keep_mean": _mean_or_none(oracle_step_rank_keep),
     }
     if reranker:
         summary.update(reranker.diagnostics())
