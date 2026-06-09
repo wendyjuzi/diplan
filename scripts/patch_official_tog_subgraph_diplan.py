@@ -198,6 +198,9 @@ def relation_search_prune_local(backend: LocalSubgraphBackend, entity_id, entity
         return []
     max_prompt_relations = int(getattr(args, "max_prompt_relations", 64))
     prompt_relations = sorted(total_relations, key=lambda r: (-_overlap(relation_label(r), question), r))[:max_prompt_relations]
+    rerank_pool_size = 0
+    if getattr(args, "planning_strategy", "tog") == "tog_diplan":
+        rerank_pool_size = int(getattr(args, "diplan_rerank_pool_size", 0))
     if args.prune_tools == "llm":
         # Use official ToG relation-prune prompt, but expose human-readable labels
         # while keeping original relation IDs parseable by clean_relations.
@@ -210,15 +213,58 @@ def relation_search_prune_local(backend: LocalSubgraphBackend, entity_id, entity
                 result = result.replace(f"{r} (label: {relation_label(r)})", r)
             flag, rels = clean_relations(result, entity_id, head_relations)
             if flag:
+                if rerank_pool_size > args.width:
+                    return _expand_relation_pool(
+                        entity_id, rels, total_relations, head_relations, question, rerank_pool_size
+                    )
                 return rels
         except Exception as exc:
             print(f"[ToG relation prune] LLM failed, fallback to lexical: {exc}", flush=True)
     # Deterministic fallback: relation-label lexical overlap.
-    ranked = sorted(total_relations, key=lambda r: (-_overlap(relation_label(r), question), r))[: args.width]
+    limit = rerank_pool_size if rerank_pool_size > args.width else args.width
+    ranked = sorted(total_relations, key=lambda r: (-_overlap(relation_label(r), question), r))[: limit]
     return [
         {"entity": entity_id, "relation": r, "score": 1.0 / (i + 1), "head": r in head_relations}
         for i, r in enumerate(ranked)
     ]
+
+
+def _expand_relation_pool(entity_id, seed_rels, total_relations, head_relations, question, pool_size):
+    """Let ToG build the action space, then expose a larger legal pool to DiPLaN.
+
+    Original ToG often returns only ``width`` relations (e.g. 3). If DiPLaN only
+    reranks those three, it can look active while having almost no room to help.
+    This keeps ToG/LLM relations first, then fills with lexical legal relations
+    so candidate-conditioned DiPLaN can choose from top-k actions before we cut
+    back to the execution width.
+    """
+    out = []
+    seen = set()
+    for i, item in enumerate(seed_rels or []):
+        rel = item.get("relation") if isinstance(item, dict) else str(item)
+        if rel in seen or rel not in total_relations:
+            continue
+        cc = dict(item) if isinstance(item, dict) else {}
+        cc.setdefault("entity", entity_id)
+        cc["relation"] = rel
+        cc.setdefault("score", 1.0 / (i + 1))
+        cc.setdefault("head", rel in head_relations)
+        out.append(cc)
+        seen.add(rel)
+    ranked = sorted(total_relations, key=lambda r: (-_overlap(relation_label(r), question), r))
+    for j, rel in enumerate(ranked):
+        if len(out) >= pool_size:
+            break
+        if rel in seen:
+            continue
+        out.append({
+            "entity": entity_id,
+            "relation": rel,
+            "score": 0.25 / (j + 1),
+            "head": rel in head_relations,
+        })
+        seen.add(rel)
+    return out
 
 
 def _overlap(text: str, question: str) -> float:
@@ -245,6 +291,11 @@ class DiPLaNReranker:
     def __init__(self, args):
         self.enabled = bool(args.diplan_ae_ckpt and args.diplan_planner_ckpt)
         self.calls = 0
+        self.candidate_count_sum = 0
+        self.top_changed = 0
+        self.value_std_sum = 0.0
+        self.prior_std_sum = 0.0
+        self.prior_nonzero_calls = 0
         if not self.enabled:
             return
         _repo_root_from_diplan_arg(args.diplan_repo)
@@ -267,14 +318,17 @@ class DiPLaNReranker:
         self.future_step_bonus = float(args.diplan_future_step_bonus)
         self.prior_min_jaccard = float(args.diplan_prior_min_jaccard)
         self.horizon = int(args.diplan_horizon)
+        self.planner_type = str(getattr(self.bundle, "planner_type", "unknown"))
 
     def rerank(self, backend: LocalSubgraphBackend, candidates, executed_prefix):
         if not self.enabled or not candidates:
             return candidates
         self.calls += 1
+        self.candidate_count_sum += len(candidates)
+        original_top = candidates[0]["relation"]
         query_tokens = list(backend.row.get("query_tokens") or backend.question.split())
         paths = [list(executed_prefix) + [c["relation"]] for c in candidates]
-        value_scores = self.score_candidates_with_value(
+        raw_value_scores = self.score_candidates_with_value(
             self.bundle.value_model,
             self.bundle.path_vocab,
             self.bundle.query_vocab,
@@ -284,7 +338,8 @@ class DiPLaNReranker:
             max_query_len=32,
             max_path_len=30,
         )
-        value_scores = _z_norm(value_scores)
+        self.value_std_sum += _std(raw_value_scores)
+        value_scores = _z_norm(raw_value_scores)
         prior_scores = [0.0 for _ in candidates]
         sampled_paths = []
         if self.prior_weight != 0.0:
@@ -313,6 +368,9 @@ class DiPLaNReranker:
                 future_bonus=self.future_step_bonus,
                 min_jaccard=self.prior_min_jaccard,
             )
+            self.prior_std_sum += _std(prior_scores)
+            if any(abs(float(x)) > 1e-12 for x in prior_scores):
+                self.prior_nonzero_calls += 1
             prior_scores = _z_norm(prior_scores)
         out = []
         for c, v, p in zip(candidates, value_scores, prior_scores):
@@ -325,7 +383,23 @@ class DiPLaNReranker:
                 + self.prior_weight * float(p)
             )
             out.append(cc)
-        return sorted(out, key=lambda x: x["score"], reverse=True)
+        out = sorted(out, key=lambda x: x["score"], reverse=True)
+        if out and out[0]["relation"] != original_top:
+            self.top_changed += 1
+        return out
+
+    def diagnostics(self):
+        denom = max(1, self.calls)
+        return {
+            "diplan_enabled": self.enabled,
+            "diplan_planner_type": getattr(self, "planner_type", "disabled"),
+            "diplan_rerank_calls": self.calls,
+            "diplan_avg_candidates_per_call": self.candidate_count_sum / denom,
+            "diplan_top_changed_rate": self.top_changed / denom,
+            "diplan_value_std_mean": self.value_std_sum / denom,
+            "diplan_prior_std_mean": self.prior_std_sum / denom,
+            "diplan_prior_nonzero_rate": self.prior_nonzero_calls / denom,
+        }
 
 
 def _candidate_diffusion_prior(relations, sampled_paths, first_bonus=1.0, future_bonus=0.35, min_jaccard=0.2):
@@ -378,6 +452,14 @@ def _z_norm(xs):
     return [(x - mu) / std for x in vals]
 
 
+def _std(xs):
+    vals = [float(x) for x in xs]
+    if not vals:
+        return 0.0
+    mu = mean(vals)
+    return (mean((x - mu) ** 2 for x in vals)) ** 0.5
+
+
 def answer_reached(backend: LocalSubgraphBackend, entity_ids) -> bool:
     return bool(set(str(x) for x in entity_ids) & backend.answers)
 
@@ -409,6 +491,8 @@ def main():
     parser.add_argument("--diplan_future_step_bonus", type=float, default=0.35)
     parser.add_argument("--diplan_prior_min_jaccard", type=float, default=0.2)
     parser.add_argument("--diplan_horizon", type=int, default=3)
+    parser.add_argument("--diplan_rerank_pool_size", type=int, default=16)
+    parser.add_argument("--diplan_post_rerank_topk", type=int, default=0)
     parser.add_argument("--diplan_num_candidates", type=int, default=16)
     parser.add_argument("--diplan_diffusion_steps", type=int, default=20)
     parser.add_argument("--diplan_jitter_std", type=float, default=0.05)
@@ -444,6 +528,8 @@ def main():
                     )
                     if reranker is not None:
                         rels = reranker.rerank(backend, rels, executed)
+                        post_topk = int(args.diplan_post_rerank_topk or args.width)
+                        rels = rels[: max(1, post_topk)]
                     current_entity_relations_list.extend(rels)
 
                 total_candidates, total_scores, total_relations = [], [], []
@@ -495,8 +581,11 @@ def main():
         "hits@1": mean([1.0 if r["success"] else 0.0 for r in records]) if records else 0.0,
         "trap@1": mean([1.0 if r["trap_at_1"] else 0.0 for r in records]) if records else 0.0,
         "first_error_step": mean([r["first_error_step"] for r in records]) if records else 0.0,
-        "diplan_rerank_calls": getattr(reranker, "calls", 0) if reranker else 0,
     }
+    if reranker:
+        summary.update(reranker.diagnostics())
+    else:
+        summary["diplan_rerank_calls"] = 0
     with (Path(args.out) / "summary_metrics.json").open("w", encoding="utf-8") as f:
         json.dump(summary, f, ensure_ascii=False, indent=2)
     print(json.dumps(summary, ensure_ascii=False, indent=2))
