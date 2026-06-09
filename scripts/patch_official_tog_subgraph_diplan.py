@@ -296,6 +296,7 @@ class DiPLaNReranker:
         self.top_changed = 0
         self.value_std_sum = 0.0
         self.prior_std_sum = 0.0
+        self.question_std_sum = 0.0
         self.prior_nonzero_calls = 0
         self.embedding_coverage_sum = 0.0
         if not self.enabled:
@@ -317,6 +318,7 @@ class DiPLaNReranker:
         self.value_weight = float(args.diplan_value_weight)
         self.prior_weight = float(args.diplan_prior_weight)
         self.score_mode = str(args.diplan_score_mode)
+        self.question_weight = float(args.diplan_question_weight)
         self.first_step_bonus = float(args.diplan_first_step_bonus)
         self.future_step_bonus = float(args.diplan_future_step_bonus)
         self.prior_min_jaccard = float(args.diplan_prior_min_jaccard)
@@ -384,22 +386,34 @@ class DiPLaNReranker:
             if any(abs(float(x)) > 1e-12 for x in prior_scores):
                 self.prior_nonzero_calls += 1
             prior_scores = _z_norm(prior_scores)
+        raw_question_scores = [
+            _question_conditioned_relation_score(backend.question, c["relation"])
+            for c in candidates
+        ]
+        self.question_std_sum += _std(raw_question_scores)
+        question_scores = _z_norm(raw_question_scores)
+        combined_prior_scores = _z_norm([
+            float(p) + self.question_weight * float(q)
+            for p, q in zip(prior_scores, question_scores)
+        ])
         out = []
-        for c, v, p in zip(candidates, value_scores, prior_scores):
+        for c, v, p, q, cp in zip(candidates, value_scores, prior_scores, question_scores, combined_prior_scores):
             cc = dict(c)
             base = float(cc["score"])
             cc["diplan_value_score"] = float(v)
             cc["diplan_prior_score"] = float(p)
+            cc["diplan_question_score"] = float(q)
+            cc["diplan_combined_prior_score"] = float(cp)
             if self.score_mode == "tog_only":
                 cc["score"] = base
             elif self.score_mode == "value_only":
                 cc["score"] = float(v) + 1e-4 * base
             elif self.score_mode == "prior_only":
-                cc["score"] = float(p) + 1e-4 * base
+                cc["score"] = float(cp) + 1e-4 * base
             elif self.score_mode == "prior_value":
-                cc["score"] = self.value_weight * float(v) + self.prior_weight * float(p) + 1e-4 * base
+                cc["score"] = self.value_weight * float(v) + self.prior_weight * float(cp) + 1e-4 * base
             else:
-                cc["score"] = base + self.value_weight * float(v) + self.prior_weight * float(p)
+                cc["score"] = base + self.value_weight * float(v) + self.prior_weight * float(cp)
             out.append(cc)
         out = sorted(out, key=lambda x: x["score"], reverse=True)
         if out and out[0]["relation"] != original_top:
@@ -411,6 +425,7 @@ class DiPLaNReranker:
             "sampled_paths_top": sampled_paths[:5],
             "value_std": _std(raw_value_scores),
             "prior_std": _std(prior_scores),
+            "question_std": _std(raw_question_scores),
             "embedding_coverage": emb_cov,
             "top_changed": bool(out and out[0]["relation"] != original_top),
         }
@@ -428,6 +443,7 @@ class DiPLaNReranker:
             "diplan_top_changed_rate": self.top_changed / denom,
             "diplan_value_std_mean": self.value_std_sum / denom,
             "diplan_prior_std_mean": self.prior_std_sum / denom,
+            "diplan_question_std_mean": self.question_std_sum / denom,
             "diplan_prior_nonzero_rate": self.prior_nonzero_calls / denom,
             "diplan_embedding_coverage_mean": self.embedding_coverage_sum / denom,
         }
@@ -600,6 +616,72 @@ def _semantic_relation_similarity(a: str, b: str) -> float:
     return score
 
 
+def _question_conditioned_relation_score(question: str, relation: str) -> float:
+    """Lightweight schema-intent prior P(relation | question).
+
+    The learned AE prior often captures entity-type neighborhoods (person ->
+    education/profession/parents). KGQA needs question-conditioned schema
+    alignment: "where was X from" should prefer place_of_birth, and "speak"
+    should prefer languages_spoken. This rule prior is intentionally transparent
+    and only changes candidate ranking; it never invents actions outside ToG's
+    legal relation pool.
+    """
+    q = " " + " ".join(_relation_tokens_norm(question)) + " "
+    r = " " + " ".join(_relation_tokens_norm(relation)) + " "
+
+    def has_any(text, toks):
+        return any(f" {t} " in text for t in toks)
+
+    score = 0.0
+
+    if has_any(q, ["where", "from", "born", "birth", "native", "hometown"]):
+        if has_any(r, ["birth", "born"]) and has_any(r, ["place", "location"]):
+            score += 3.0
+        if has_any(r, ["nationality"]):
+            score += 1.0
+        if has_any(r, ["death"]):
+            score -= 1.5
+        if has_any(r, ["education", "profession", "parent"]):
+            score -= 0.6
+
+    if has_any(q, ["speak", "spoken", "language", "linguistic"]):
+        if has_any(r, ["language", "spoken", "official"]):
+            score += 3.0
+        if has_any(r, ["country"]) and has_any(r, ["spoken", "language"]):
+            score += 1.0
+
+    if has_any(q, ["marry", "married", "wife", "husband", "spouse"]):
+        if has_any(r, ["spouse", "marriage", "wife", "husband"]):
+            score += 3.0
+
+    if has_any(q, ["do", "job", "occupation", "profession", "work", "before", "president", "office", "position"]):
+        if has_any(r, ["position", "office", "held", "profession", "occupation"]):
+            score += 2.0
+        if has_any(r, ["write", "author", "book"]) and not has_any(q, ["book", "write", "author"]):
+            score -= 1.0
+
+    if has_any(q, ["invent", "invention", "idea", "discover"]):
+        if has_any(r, ["invent", "idea", "innovator", "original"]):
+            score += 3.0
+
+    if has_any(q, ["capital"]):
+        if has_any(r, ["capital"]):
+            score += 3.0
+
+    if has_any(q, ["located", "location", "where"]):
+        if has_any(r, ["containedby", "contains", "location", "place"]):
+            score += 0.8
+
+    noisy = (
+        relation.startswith("base.biblioness.")
+        or relation.startswith("base.kwebbase.")
+        or relation.startswith("base.aareas.schema.")
+    )
+    if noisy:
+        score -= 0.5
+    return score
+
+
 def _relation_tokens_norm(rel: str):
     out = []
     for raw in rel.lower().replace(".", " ").replace("_", " ").replace("-", " ").split():
@@ -658,6 +740,7 @@ def _compact_relation_list(items, topk=5):
             "score": round(float(x.get("score", 0.0)), 4),
             "value": round(float(x.get("diplan_value_score", 0.0)), 4),
             "prior": round(float(x.get("diplan_prior_score", 0.0)), 4),
+            "qprior": round(float(x.get("diplan_question_score", 0.0)), 4),
             "head": bool(x.get("head", False)),
         })
     return out
@@ -847,6 +930,7 @@ def main():
     parser.add_argument("--diplan_value_ckpt", default="")
     parser.add_argument("--diplan_value_weight", type=float, default=1.0)
     parser.add_argument("--diplan_prior_weight", type=float, default=1.0)
+    parser.add_argument("--diplan_question_weight", type=float, default=1.0)
     parser.add_argument(
         "--diplan_score_mode",
         type=str,
