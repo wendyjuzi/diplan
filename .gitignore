@@ -6,3 +6,8 @@ data/
 __pycache__/
 *.pyc
 *.pt
+.idea/
+Meta-Llama-3.1-8B-Instruct/
+__tmp_nature_skills_repo/
+result_paper/
+result_paper_tables/

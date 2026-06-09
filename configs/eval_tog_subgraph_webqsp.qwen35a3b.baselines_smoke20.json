@@ -1,0 +1,27 @@
+{
+  "test_path": "data/rog_processed/webqsp_test.jsonl",
+  "include_datasets": ["webqsp"],
+  "max_tasks": 20,
+  "seed": 42,
+  "progress_every": 1,
+
+  "scorer": "llm",
+
+  "methods": ["single_step", "beam", "lookahead", "flare"],
+
+  "k": 8,
+  "num_retain_entity": 5,
+  "beam": {"B": 8, "depth": 3},
+  "lookahead": {"k": 2},
+  "flare": {"S": 16, "c": 1.4, "k": 8, "H": 3, "mem_cap": 200, "mem_sim": 0.9},
+
+  "llm_api_base": "http://127.0.0.1:8000/v1",
+  "llm_api_key": "EMPTY",
+  "llm_model": "Qwen3.5-35B-A3B-FP8",
+  "llm_temperature": 0.1,
+  "llm_max_tokens": 128,
+  "llm_timeout_s": 60,
+  "llm_retries": 2,
+  "llm_max_relations_in_prompt": 128,
+  "llm_proposal_fusion": "rerank_hybrid"
+}

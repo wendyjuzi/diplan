@@ -1,0 +1,26 @@
+{
+  "test_path": "data/rog_processed/webqsp_test.jsonl",
+  "include_datasets": ["webqsp"],
+  "max_tasks": 20,
+  "seed": 42,
+
+  "scorer": "llm",
+
+  "methods": ["single_step", "beam", "lookahead", "flare", "diplan_diffusion"],
+
+  "k": 8,
+  "flare": {"S": 4, "c": 1.4, "k": 8, "H": 3, "mem_cap": 200, "mem_sim": 0.9},
+  "beam": {"B": 8, "depth": 3},
+  "lookahead": {"k": 2},
+
+  "diffusion": {"num_candidates": 16, "diffusion_steps": 20, "use_prefix": true, "jitter_std": 0.05},
+
+  "llm_api_base": "http://127.0.0.1:8000/v1",
+  "llm_api_key": "EMPTY",
+  "llm_model": "meta-llama/Meta-Llama-3.1-8B-Instruct",
+  "llm_temperature": 0.1,
+  "llm_max_tokens": 128,
+  "llm_timeout_s": 30,
+  "llm_retries": 2,
+  "llm_top_k": 8
+}
