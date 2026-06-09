@@ -296,6 +296,7 @@ class DiPLaNReranker:
         self.value_std_sum = 0.0
         self.prior_std_sum = 0.0
         self.prior_nonzero_calls = 0
+        self.embedding_coverage_sum = 0.0
         if not self.enabled:
             return
         _repo_root_from_diplan_arg(args.diplan_repo)
@@ -319,6 +320,8 @@ class DiPLaNReranker:
         self.prior_min_jaccard = float(args.diplan_prior_min_jaccard)
         self.horizon = int(args.diplan_horizon)
         self.planner_type = str(getattr(self.bundle, "planner_type", "unknown"))
+        self.path_embedding = _find_embedding_weight(self.bundle.autoencoder)
+        self.projection_mode = "ae_embedding" if self.path_embedding is not None else "semantic_fallback"
         self.last_debug = None
 
     def rerank(self, backend: LocalSubgraphBackend, candidates, executed_prefix):
@@ -330,6 +333,8 @@ class DiPLaNReranker:
         original_top = candidates[0]["relation"]
         before_top = _compact_relation_list(candidates, topk=8)
         query_tokens = list(backend.row.get("query_tokens") or backend.question.split())
+        emb_cov = _embedding_coverage([c["relation"] for c in candidates], self.bundle.path_vocab, self.path_embedding)
+        self.embedding_coverage_sum += emb_cov
         paths = [list(executed_prefix) + [c["relation"]] for c in candidates]
         raw_value_scores = self.score_candidates_with_value(
             self.bundle.value_model,
@@ -370,6 +375,8 @@ class DiPLaNReranker:
                 first_bonus=self.first_step_bonus,
                 future_bonus=self.future_step_bonus,
                 min_jaccard=self.prior_min_jaccard,
+                path_vocab=self.bundle.path_vocab,
+                path_embedding=self.path_embedding,
             )
             self.prior_std_sum += _std(prior_scores)
             if any(abs(float(x)) > 1e-12 for x in prior_scores):
@@ -396,6 +403,7 @@ class DiPLaNReranker:
             "sampled_paths_top": sampled_paths[:5],
             "value_std": _std(raw_value_scores),
             "prior_std": _std(prior_scores),
+            "embedding_coverage": emb_cov,
             "top_changed": bool(out and out[0]["relation"] != original_top),
         }
         return out
@@ -405,12 +413,14 @@ class DiPLaNReranker:
         return {
             "diplan_enabled": self.enabled,
             "diplan_planner_type": getattr(self, "planner_type", "disabled"),
+            "diplan_projection_mode": getattr(self, "projection_mode", "disabled"),
             "diplan_rerank_calls": self.calls,
             "diplan_avg_candidates_per_call": self.candidate_count_sum / denom,
             "diplan_top_changed_rate": self.top_changed / denom,
             "diplan_value_std_mean": self.value_std_sum / denom,
             "diplan_prior_std_mean": self.prior_std_sum / denom,
             "diplan_prior_nonzero_rate": self.prior_nonzero_calls / denom,
+            "diplan_embedding_coverage_mean": self.embedding_coverage_sum / denom,
         }
 
 
@@ -421,16 +431,43 @@ def _candidate_diffusion_prior(relations, sampled_paths, first_bonus=1.0, future
     must remain one of ToG's admissible graph relations. Exact first-step matches
     get the strongest signal; fuzzy/future matches are weaker trajectory priors.
     """
+    return _candidate_diffusion_prior_impl(
+        relations,
+        sampled_paths,
+        first_bonus=first_bonus,
+        future_bonus=future_bonus,
+        min_jaccard=min_jaccard,
+        path_vocab=None,
+        path_embedding=None,
+    )
+
+
+def _candidate_diffusion_prior_impl(
+    relations,
+    sampled_paths,
+    first_bonus=1.0,
+    future_bonus=0.35,
+    min_jaccard=0.2,
+    path_vocab=None,
+    path_embedding=None,
+):
     scores = [0.0 for _ in relations]
     if not sampled_paths:
         return scores
+    rel_embs = [_relation_embedding(rel, path_vocab, path_embedding) for rel in relations]
     for path in sampled_paths:
         if not path:
             continue
         for i, rel in enumerate(relations):
             best = 0.0
             for j, tok in enumerate(path):
-                sim = 1.0 if tok == rel else _semantic_relation_similarity(tok, rel)
+                sim = 1.0 if tok == rel else _project_relation_similarity(
+                    tok,
+                    rel,
+                    rel_emb=rel_embs[i],
+                    path_vocab=path_vocab,
+                    path_embedding=path_embedding,
+                )
                 if sim < min_jaccard:
                     continue
                 if j == 0:
@@ -442,6 +479,79 @@ def _candidate_diffusion_prior(relations, sampled_paths, first_bonus=1.0, future
             scores[i] += best
     denom = max(1, len(sampled_paths))
     return [s / denom for s in scores]
+
+
+def _candidate_diffusion_prior(relations, sampled_paths, first_bonus=1.0, future_bonus=0.35, min_jaccard=0.2,
+                               path_vocab=None, path_embedding=None):
+    return _candidate_diffusion_prior_impl(
+        relations,
+        sampled_paths,
+        first_bonus=first_bonus,
+        future_bonus=future_bonus,
+        min_jaccard=min_jaccard,
+        path_vocab=path_vocab,
+        path_embedding=path_embedding,
+    )
+
+
+def _project_relation_similarity(sampled_rel, candidate_rel, rel_emb=None, path_vocab=None, path_embedding=None):
+    emb_score = 0.0
+    sampled_emb = _relation_embedding(sampled_rel, path_vocab, path_embedding)
+    if sampled_emb is not None and rel_emb is not None:
+        emb_score = _cosine(sampled_emb, rel_emb)
+        # Convert cosine from roughly [-1,1] to [0,1] and keep weak evidence weak.
+        emb_score = max(0.0, (emb_score + 1.0) / 2.0)
+    lex_score = _semantic_relation_similarity(sampled_rel, candidate_rel)
+    if emb_score > 0.0:
+        return 0.70 * emb_score + 0.30 * lex_score
+    return lex_score
+
+
+def _find_embedding_weight(module):
+    try:
+        import torch
+        for sub in module.modules():
+            if isinstance(sub, torch.nn.Embedding):
+                return sub.weight.detach().cpu()
+    except Exception:
+        return None
+    return None
+
+
+def _relation_embedding(rel, path_vocab, path_embedding):
+    if path_vocab is None or path_embedding is None:
+        return None
+    idx = getattr(path_vocab, "stoi", {}).get(rel)
+    if idx is None:
+        return None
+    try:
+        if idx < 0 or idx >= path_embedding.shape[0]:
+            return None
+        return path_embedding[idx]
+    except Exception:
+        return None
+
+
+def _embedding_coverage(relations, path_vocab, path_embedding):
+    if path_vocab is None or path_embedding is None or not relations:
+        return 0.0
+    hit = 0
+    stoi = getattr(path_vocab, "stoi", {})
+    for rel in relations:
+        idx = stoi.get(rel)
+        if idx is not None and 0 <= idx < path_embedding.shape[0]:
+            hit += 1
+    return hit / max(1, len(relations))
+
+
+def _cosine(a, b):
+    try:
+        denom = float(a.norm().item() * b.norm().item())
+        if denom <= 1e-12:
+            return 0.0
+        return float((a * b).sum().item() / denom)
+    except Exception:
+        return 0.0
 
 
 def _semantic_relation_similarity(a: str, b: str) -> float:
@@ -620,7 +730,9 @@ def _print_trace(task_no, trace_record, topk):
             if ent.get("rerank"):
                 rr = ent["rerank"]
                 print(
-                    f"      rerank changed={rr.get('top_changed')} value_std={rr.get('value_std'):.4f} prior_std={rr.get('prior_std'):.4f}",
+                    f"      rerank changed={rr.get('top_changed')} "
+                    f"value_std={rr.get('value_std'):.4f} prior_std={rr.get('prior_std'):.4f} "
+                    f"emb_cov={rr.get('embedding_coverage', 0.0):.2f}",
                     flush=True,
                 )
                 print(f"      before={rr.get('before_top', [])[:topk]}", flush=True)
