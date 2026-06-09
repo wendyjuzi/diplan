@@ -73,3 +73,69 @@ Outputs `summary_metrics.json`, `summary_by_dataset.json`, `predictions.jsonl`, 
 - **ALFWorld** (paper's tool-use setting) — separate follow-up; runs on the autodl server.
 - Oracle paths come from in-subgraph BFS (RoG rows carry no relation chain); Hits@1 is robust to
   this, First-Error/Recovery are relative to that BFS oracle.
+# Question-Conditioned Relation Retrieval
+
+The ToG-DiPLaN runner separates three signals:
+
+1. `QueryRelationScorer`: contrastively trained estimate of
+   `P(relation | question)`.
+2. AE trajectory prior: projection from generated future paths onto ToG's
+   legal candidate relations.
+3. Value ranker: downstream trajectory-quality estimate.
+
+This separation follows the retrieval-then-reasoning pattern used by KGQA
+systems such as UniKGQA and RoG, while preserving FLARE's future-aware action
+selection principle. The learned relation scorer should be trained only on the
+training split; never train it on WebQSP/CWQ test questions.
+
+Train:
+
+```bash
+python train_relation_scorer_torch.py \
+  --train_path data/rog_processed/webqsp_train.jsonl \
+  --valid_path data/rog_processed/webqsp_dev.jsonl \
+  --out runs/relation_scorer_webqsp_seed42 \
+  --seed 42
+```
+
+Pass the resulting checkpoint to the official-ToG adapted runner:
+
+```bash
+--diplan_relation_scorer_ckpt \
+  /root/autodl-tmp/DiPLaN/runs/relation_scorer_webqsp_seed42/best.pt
+```
+
+Recommended ablations:
+
+```text
+tog_only       ToG proposal score
+question_only  learned question-relation retrieval
+prior_only     question prior + AE trajectory prior
+value_only     trajectory value only
+prior_value    question/AE prior + trajectory value
+fused          ToG + question/AE prior + trajectory value
+```
+
+Report the full decision funnel in addition to Hits@1:
+
+```text
+oracle_in_pool_rate
+oracle_in_keep_rate
+oracle_selected_step_rate
+oracle_executed_top1_rate
+oracle_step_rank_before_mean
+oracle_step_rank_after_mean
+```
+
+Literature basis:
+
+- UniKGQA (ICLR 2023): question-relation semantic matching shared by retrieval
+  and reasoning, https://arxiv.org/abs/2212.00959
+- RoG (ICLR 2024): explicit relation paths as plans in a
+  planning-retrieval-reasoning pipeline, https://arxiv.org/abs/2310.01061
+- ToG: interactive KG exploration with beam search,
+  https://arxiv.org/abs/2307.07697
+- RE-KBQA: additional relation supervision and relation-guided reranking,
+  https://arxiv.org/abs/2305.02118
+- Why Reasoning Fails to Plan / FLARE: future-aware evaluation and limited
+  commitment, https://arxiv.org/abs/2601.22311

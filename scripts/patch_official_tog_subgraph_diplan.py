@@ -304,9 +304,11 @@ class DiPLaNReranker:
         _repo_root_from_diplan_arg(args.diplan_repo)
         from src.diplan.planners import load_diffusion_bundle
         from src.diplan.inference import sample_plan_candidates, score_candidates_with_value
+        from src.diplan.relation_scorer import load_relation_scorer, score_relations
 
         self.sample_plan_candidates = sample_plan_candidates
         self.score_candidates_with_value = score_candidates_with_value
+        self.score_relations = score_relations
         self.bundle = load_diffusion_bundle(args.diplan_ae_ckpt, args.diplan_planner_ckpt, args.diplan_value_ckpt, {
             "diffusion": {
                 "num_candidates": args.diplan_num_candidates,
@@ -326,6 +328,12 @@ class DiPLaNReranker:
         self.planner_type = str(getattr(self.bundle, "planner_type", "unknown"))
         self.path_embedding = _find_embedding_weight(self.bundle.autoencoder)
         self.projection_mode = "ae_embedding" if self.path_embedding is not None else "semantic_fallback"
+        self.relation_scorer = (
+            load_relation_scorer(args.diplan_relation_scorer_ckpt)
+            if args.diplan_relation_scorer_ckpt
+            else None
+        )
+        self.question_prior_mode = "learned_contrastive" if self.relation_scorer is not None else "schema_fallback"
         self.last_debug = None
 
     def rerank(self, backend: LocalSubgraphBackend, candidates, executed_prefix):
@@ -386,10 +394,19 @@ class DiPLaNReranker:
             if any(abs(float(x)) > 1e-12 for x in prior_scores):
                 self.prior_nonzero_calls += 1
             prior_scores = _z_norm(prior_scores)
-        raw_question_scores = [
-            _question_conditioned_relation_score(backend.question, c["relation"])
-            for c in candidates
-        ]
+        if self.relation_scorer is not None:
+            raw_question_scores = self.score_relations(
+                self.relation_scorer,
+                backend.question,
+                query_tokens,
+                [c["relation"] for c in candidates],
+                executed_prefix=executed_prefix,
+            )
+        else:
+            raw_question_scores = [
+                _question_conditioned_relation_score(backend.question, c["relation"])
+                for c in candidates
+            ]
         self.question_std_sum += _std(raw_question_scores)
         question_scores = _z_norm(raw_question_scores)
         combined_prior_scores = _z_norm([
@@ -408,6 +425,8 @@ class DiPLaNReranker:
                 cc["score"] = base
             elif self.score_mode == "value_only":
                 cc["score"] = float(v) + 1e-4 * base
+            elif self.score_mode == "question_only":
+                cc["score"] = float(q) + 1e-4 * base
             elif self.score_mode == "prior_only":
                 cc["score"] = float(cp) + 1e-4 * base
             elif self.score_mode == "prior_value":
@@ -437,6 +456,7 @@ class DiPLaNReranker:
             "diplan_enabled": self.enabled,
             "diplan_planner_type": getattr(self, "planner_type", "disabled"),
             "diplan_projection_mode": getattr(self, "projection_mode", "disabled"),
+            "diplan_question_prior_mode": getattr(self, "question_prior_mode", "disabled"),
             "diplan_score_mode": getattr(self, "score_mode", "disabled"),
             "diplan_rerank_calls": self.calls,
             "diplan_avg_candidates_per_call": self.candidate_count_sum / denom,
@@ -928,6 +948,7 @@ def main():
     parser.add_argument("--diplan_ae_ckpt", default="")
     parser.add_argument("--diplan_planner_ckpt", default="")
     parser.add_argument("--diplan_value_ckpt", default="")
+    parser.add_argument("--diplan_relation_scorer_ckpt", default="")
     parser.add_argument("--diplan_value_weight", type=float, default=1.0)
     parser.add_argument("--diplan_prior_weight", type=float, default=1.0)
     parser.add_argument("--diplan_question_weight", type=float, default=1.0)
@@ -935,7 +956,7 @@ def main():
         "--diplan_score_mode",
         type=str,
         default="fused",
-        choices=["tog_only", "value_only", "prior_only", "prior_value", "fused"],
+        choices=["tog_only", "value_only", "question_only", "prior_only", "prior_value", "fused"],
     )
     parser.add_argument("--diplan_first_step_bonus", type=float, default=1.0)
     parser.add_argument("--diplan_future_step_bonus", type=float, default=0.35)
