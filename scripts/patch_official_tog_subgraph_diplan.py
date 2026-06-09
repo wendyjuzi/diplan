@@ -430,7 +430,7 @@ def _candidate_diffusion_prior(relations, sampled_paths, first_bonus=1.0, future
         for i, rel in enumerate(relations):
             best = 0.0
             for j, tok in enumerate(path):
-                sim = 1.0 if tok == rel else _relation_jaccard(tok, rel)
+                sim = 1.0 if tok == rel else _semantic_relation_similarity(tok, rel)
                 if sim < min_jaccard:
                     continue
                 if j == 0:
@@ -442,6 +442,93 @@ def _candidate_diffusion_prior(relations, sampled_paths, first_bonus=1.0, future
             scores[i] += best
     denom = max(1, len(sampled_paths))
     return [s / denom for s in scores]
+
+
+def _semantic_relation_similarity(a: str, b: str) -> float:
+    """Robust relation matching for projecting generated paths to legal actions.
+
+    Raw Freebase ids are brittle: ``countries_spoken_in`` and
+    ``languages_spoken`` should be close, while a generic ``*.country`` edge
+    should not steal all the prior mass. We use normalized relation tokens,
+    relation-tail overlap, and a small noisy-namespace penalty.
+    """
+    aa = _relation_tokens_norm(a)
+    bb = _relation_tokens_norm(b)
+    if not aa or not bb:
+        return 0.0
+    inter = len(set(aa) & set(bb))
+    union = len(set(aa) | set(bb))
+    jaccard = inter / union if union else 0.0
+
+    # Last tokens often carry the relation intent: languages_spoken, official_language.
+    tail_a = set(aa[-3:])
+    tail_b = set(bb[-3:])
+    tail_union = len(tail_a | tail_b)
+    tail = (len(tail_a & tail_b) / tail_union) if tail_union else 0.0
+
+    # Directional coverage helps short canonical labels such as language/spoken.
+    cover_b = inter / max(1, len(set(bb)))
+    score = 0.45 * jaccard + 0.35 * tail + 0.20 * cover_b
+
+    # Demote noisy bookkeeping namespaces that share only broad words like country.
+    noisy = (
+        b.startswith("base.biblioness.")
+        or b.startswith("base.kwebbase.")
+        or b.startswith("base.aareas.schema.")
+    )
+    if noisy and len(set(aa) & set(bb) & {"language", "speak", "spoken", "official"}) == 0:
+        score *= 0.35
+    return score
+
+
+def _relation_tokens_norm(rel: str):
+    out = []
+    for raw in rel.lower().replace(".", " ").replace("_", " ").replace("-", " ").split():
+        tok = raw.strip()
+        if not tok or tok in {"base", "common", "freebase", "type", "object", "schema", "biblioness", "kwebbase"}:
+            continue
+        tok = _canonical_relation_token(tok)
+        if tok:
+            out.append(tok)
+    return out
+
+
+def _canonical_relation_token(tok: str) -> str:
+    aliases = {
+        "countries": "country",
+        "locations": "location",
+        "languages": "language",
+        "speaks": "spoken",
+        "speak": "spoken",
+        "spoke": "spoken",
+        "speaking": "spoken",
+        "spoken": "spoken",
+        "official": "official",
+        "position": "position",
+        "positions": "position",
+        "held": "held",
+        "office": "office",
+        "offices": "office",
+        "president": "president",
+        "presidential": "president",
+        "politicians": "politician",
+        "works": "work",
+        "written": "write",
+        "wrote": "write",
+        "writer": "write",
+        "authors": "author",
+        "ideas": "idea",
+        "invented": "invent",
+        "inventions": "invent",
+        "innovator": "invent",
+    }
+    if tok in aliases:
+        return aliases[tok]
+    if len(tok) > 4 and tok.endswith("ies"):
+        return tok[:-3] + "y"
+    if len(tok) > 3 and tok.endswith("s"):
+        return tok[:-1]
+    return tok
 
 
 def _compact_relation_list(items, topk=5):
@@ -457,9 +544,27 @@ def _compact_relation_list(items, topk=5):
     return out
 
 
+def _relation_rank(items, target):
+    if not target:
+        return None
+    for i, x in enumerate(items, start=1):
+        rel = x.get("relation") if isinstance(x, dict) else str(x)
+        if rel == target:
+            return i
+    return None
+
+
+def _oracle_next_relation(backend: LocalSubgraphBackend, executed_prefix):
+    oracle = list(backend.oracle_path or [])
+    idx = len(executed_prefix)
+    if idx < len(oracle):
+        return oracle[idx]
+    return None
+
+
 def _relation_jaccard(a: str, b: str) -> float:
-    aa = {t for t in a.lower().replace(".", " ").replace("_", " ").split() if t}
-    bb = {t for t in b.lower().replace(".", " ").replace("_", " ").split() if t}
+    aa = set(_relation_tokens_norm(a))
+    bb = set(_relation_tokens_norm(b))
     if not aa or not bb:
         return 0.0
     return len(aa & bb) / len(aa | bb)
@@ -505,7 +610,11 @@ def _print_trace(task_no, trace_record, topk):
         print(f"  step={step['depth']} topic_entities={step['topic_entities']}", flush=True)
         for ent in step.get("entity_expansions", []):
             print(
-                f"    entity={ent['entity']} pool={ent['num_relations']} kept={len(ent.get('kept_after_rerank', []))}",
+                f"    entity={ent['entity']} pool={ent['num_relations']} kept={len(ent.get('kept_after_rerank', []))} "
+                f"oracle_next={ent.get('oracle_next_relation')} "
+                f"rank_before={ent.get('oracle_rank_before_rerank')} "
+                f"rank_after={ent.get('oracle_rank_after_rerank_full')} "
+                f"rank_keep={ent.get('oracle_rank_after_keep')}",
                 flush=True,
             )
             if ent.get("rerank"):
@@ -520,7 +629,9 @@ def _print_trace(task_no, trace_record, topk):
             else:
                 print(f"      rels={ent.get('kept_after_rerank', [])[:topk]}", flush=True)
         print(
-            f"    selected_relations={step.get('selected_relations')} selected_entities={step.get('selected_entities')} reached={step.get('answer_reached')}",
+            f"    selected_relations={step.get('selected_relations')} "
+            f"oracle_selected={step.get('oracle_selected')} "
+            f"selected_entities={step.get('selected_entities')} reached={step.get('answer_reached')}",
             flush=True,
         )
     print("=" * 88 + "\n", flush=True)
@@ -596,13 +707,16 @@ def main():
                 for i, entity in enumerate(list(topic_entity.keys())):
                     if entity == "[FINISH_ID]":
                         continue
+                    oracle_next = _oracle_next_relation(backend, executed)
                     rels = relation_search_prune_local(
                         backend, entity, topic_entity[entity], pre_relations, pre_heads[i], question, args
                     )
                     ent_trace = {
                         "entity": entity,
                         "entity_name": topic_entity[entity],
+                        "oracle_next_relation": oracle_next,
                         "num_relations": len(rels),
+                        "oracle_rank_before_rerank": _relation_rank(rels, oracle_next),
                         "relations_before_rerank": _compact_relation_list(rels, topk=args.trace_topk),
                         "rerank": None,
                     }
@@ -610,7 +724,11 @@ def main():
                         rels = reranker.rerank(backend, rels, executed)
                         ent_trace["rerank"] = reranker.last_debug
                         post_topk = int(args.diplan_post_rerank_topk or args.width)
+                        ent_trace["oracle_rank_after_rerank_full"] = _relation_rank(rels, oracle_next)
                         rels = rels[: max(1, post_topk)]
+                    else:
+                        ent_trace["oracle_rank_after_rerank_full"] = ent_trace["oracle_rank_before_rerank"]
+                    ent_trace["oracle_rank_after_keep"] = _relation_rank(rels, oracle_next)
                     ent_trace["kept_after_rerank"] = _compact_relation_list(rels, topk=args.trace_topk)
                     step_trace["entity_expansions"].append(ent_trace)
                     current_entity_relations_list.extend(rels)
@@ -642,6 +760,8 @@ def main():
                 step_trace["selected_relations"] = list(pre_relations)
                 step_trace["selected_entities"] = list(entities_id)
                 step_trace["selected_heads"] = list(pre_heads)
+                step_trace["oracle_next_relation"] = _oracle_next_relation(backend, executed)
+                step_trace["oracle_selected"] = bool(step_trace["oracle_next_relation"] in set(pre_relations))
                 if pre_relations:
                     executed.append(pre_relations[0])
                 cluster_chain_of_entities.append(chain_of_entities)
