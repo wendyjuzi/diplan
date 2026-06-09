@@ -319,13 +319,16 @@ class DiPLaNReranker:
         self.prior_min_jaccard = float(args.diplan_prior_min_jaccard)
         self.horizon = int(args.diplan_horizon)
         self.planner_type = str(getattr(self.bundle, "planner_type", "unknown"))
+        self.last_debug = None
 
     def rerank(self, backend: LocalSubgraphBackend, candidates, executed_prefix):
         if not self.enabled or not candidates:
+            self.last_debug = None
             return candidates
         self.calls += 1
         self.candidate_count_sum += len(candidates)
         original_top = candidates[0]["relation"]
+        before_top = _compact_relation_list(candidates, topk=8)
         query_tokens = list(backend.row.get("query_tokens") or backend.question.split())
         paths = [list(executed_prefix) + [c["relation"]] for c in candidates]
         raw_value_scores = self.score_candidates_with_value(
@@ -386,6 +389,15 @@ class DiPLaNReranker:
         out = sorted(out, key=lambda x: x["score"], reverse=True)
         if out and out[0]["relation"] != original_top:
             self.top_changed += 1
+        self.last_debug = {
+            "num_candidates": len(candidates),
+            "before_top": before_top,
+            "after_top": _compact_relation_list(out, topk=8),
+            "sampled_paths_top": sampled_paths[:5],
+            "value_std": _std(raw_value_scores),
+            "prior_std": _std(prior_scores),
+            "top_changed": bool(out and out[0]["relation"] != original_top),
+        }
         return out
 
     def diagnostics(self):
@@ -432,6 +444,19 @@ def _candidate_diffusion_prior(relations, sampled_paths, first_bonus=1.0, future
     return [s / denom for s in scores]
 
 
+def _compact_relation_list(items, topk=5):
+    out = []
+    for x in list(items)[:topk]:
+        out.append({
+            "relation": x.get("relation"),
+            "score": round(float(x.get("score", 0.0)), 4),
+            "value": round(float(x.get("diplan_value_score", 0.0)), 4),
+            "prior": round(float(x.get("diplan_prior_score", 0.0)), 4),
+            "head": bool(x.get("head", False)),
+        })
+    return out
+
+
 def _relation_jaccard(a: str, b: str) -> float:
     aa = {t for t in a.lower().replace(".", " ").replace("_", " ").split() if t}
     bb = {t for t in b.lower().replace(".", " ").replace("_", " ").split() if t}
@@ -462,6 +487,43 @@ def _std(xs):
 
 def answer_reached(backend: LocalSubgraphBackend, entity_ids) -> bool:
     return bool(set(str(x) for x in entity_ids) & backend.answers)
+
+
+def _str2bool(x):
+    if isinstance(x, bool):
+        return x
+    return str(x).lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _print_trace(task_no, trace_record, topk):
+    print("\n" + "=" * 88, flush=True)
+    print(f"[trace] task={task_no} id={trace_record.get('task_id')} success={trace_record.get('success')}", flush=True)
+    print(f"[question] {trace_record.get('question')}", flush=True)
+    print(f"[oracle] {trace_record.get('oracle_path')}", flush=True)
+    print(f"[executed] {trace_record.get('executed_path')}", flush=True)
+    for step in trace_record.get("steps", []):
+        print(f"  step={step['depth']} topic_entities={step['topic_entities']}", flush=True)
+        for ent in step.get("entity_expansions", []):
+            print(
+                f"    entity={ent['entity']} pool={ent['num_relations']} kept={len(ent.get('kept_after_rerank', []))}",
+                flush=True,
+            )
+            if ent.get("rerank"):
+                rr = ent["rerank"]
+                print(
+                    f"      rerank changed={rr.get('top_changed')} value_std={rr.get('value_std'):.4f} prior_std={rr.get('prior_std'):.4f}",
+                    flush=True,
+                )
+                print(f"      before={rr.get('before_top', [])[:topk]}", flush=True)
+                print(f"      after ={rr.get('after_top', [])[:topk]}", flush=True)
+                print(f"      sampled={rr.get('sampled_paths_top', [])[:2]}", flush=True)
+            else:
+                print(f"      rels={ent.get('kept_after_rerank', [])[:topk]}", flush=True)
+        print(
+            f"    selected_relations={step.get('selected_relations')} selected_entities={step.get('selected_entities')} reached={step.get('answer_reached')}",
+            flush=True,
+        )
+    print("=" * 88 + "\n", flush=True)
 
 
 def main():
@@ -496,15 +558,19 @@ def main():
     parser.add_argument("--diplan_num_candidates", type=int, default=16)
     parser.add_argument("--diplan_diffusion_steps", type=int, default=20)
     parser.add_argument("--diplan_jitter_std", type=float, default=0.05)
+    parser.add_argument("--show_trace", type=_str2bool, default=False)
+    parser.add_argument("--trace_limit", type=int, default=5)
+    parser.add_argument("--trace_topk", type=int, default=5)
     args = parser.parse_args()
 
     rows = _load_jsonl(args.subgraph_jsonl, args.max_tasks)
     reranker = DiPLaNReranker(args) if args.planning_strategy == "tog_diplan" else None
     Path(args.out).mkdir(parents=True, exist_ok=True)
     pred_path = Path(args.out) / "predictions.jsonl"
+    trace_path = Path(args.out) / "trace.jsonl"
     records = []
-    with pred_path.open("w", encoding="utf-8") as fout:
-        for row in tqdm(rows):
+    with pred_path.open("w", encoding="utf-8") as fout, trace_path.open("w", encoding="utf-8") as ftrace:
+        for task_idx, row in enumerate(tqdm(rows), start=1):
             backend = LocalSubgraphBackend(row)
             # Official ToG's entity_prune calls id2entity_name_or_type from utils'
             # global namespace. Override it per row so entity_prune stays official
@@ -517,19 +583,36 @@ def main():
             pre_heads = [-1] * len(topic_entity)
             executed = []
             success = False
+            trace_steps = []
 
             for depth in range(1, args.depth + 1):
                 current_entity_relations_list = []
+                step_trace = {
+                    "depth": depth,
+                    "topic_entities": dict(topic_entity),
+                    "executed_prefix": list(executed),
+                    "entity_expansions": [],
+                }
                 for i, entity in enumerate(list(topic_entity.keys())):
                     if entity == "[FINISH_ID]":
                         continue
                     rels = relation_search_prune_local(
                         backend, entity, topic_entity[entity], pre_relations, pre_heads[i], question, args
                     )
+                    ent_trace = {
+                        "entity": entity,
+                        "entity_name": topic_entity[entity],
+                        "num_relations": len(rels),
+                        "relations_before_rerank": _compact_relation_list(rels, topk=args.trace_topk),
+                        "rerank": None,
+                    }
                     if reranker is not None:
                         rels = reranker.rerank(backend, rels, executed)
+                        ent_trace["rerank"] = reranker.last_debug
                         post_topk = int(args.diplan_post_rerank_topk or args.width)
                         rels = rels[: max(1, post_topk)]
+                    ent_trace["kept_after_rerank"] = _compact_relation_list(rels, topk=args.trace_topk)
+                    step_trace["entity_expansions"].append(ent_trace)
                     current_entity_relations_list.extend(rels)
 
                 total_candidates, total_scores, total_relations = [], [], []
@@ -549,15 +632,23 @@ def main():
                         total_entities_id, total_topic_entities, total_head,
                     )
                 if not total_candidates:
+                    step_trace["stopped"] = "no_total_candidates"
+                    trace_steps.append(step_trace)
                     break
                 flag, chain_of_entities, entities_id, pre_relations, pre_heads = entity_prune(
                     total_entities_id, total_relations, total_candidates,
                     total_topic_entities, total_head, total_scores, args
                 )
+                step_trace["selected_relations"] = list(pre_relations)
+                step_trace["selected_entities"] = list(entities_id)
+                step_trace["selected_heads"] = list(pre_heads)
                 if pre_relations:
                     executed.append(pre_relations[0])
                 cluster_chain_of_entities.append(chain_of_entities)
                 success = answer_reached(backend, entities_id)
+                step_trace["answer_reached"] = bool(success)
+                step_trace["continue_flag"] = bool(flag)
+                trace_steps.append(step_trace)
                 if success or not flag:
                     break
                 topic_entity = {entity: backend.id2name(entity) for entity in entities_id}
@@ -573,8 +664,13 @@ def main():
                 "trap_at_1": bool(executed and trap and executed[0] == trap[0]),
                 "first_error_step": _first_error_step(executed, oracle),
             }
+            trace_rec = dict(rec)
+            trace_rec["steps"] = trace_steps
             records.append(rec)
             fout.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            ftrace.write(json.dumps(trace_rec, ensure_ascii=False) + "\n")
+            if args.show_trace and task_idx <= args.trace_limit:
+                _print_trace(task_idx, trace_rec, args.trace_topk)
 
     summary = {
         "n": len(records),
