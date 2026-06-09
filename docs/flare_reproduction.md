@@ -127,6 +127,20 @@ oracle_step_rank_before_mean
 oracle_step_rank_after_mean
 ```
 
+Because a KG may contain multiple valid answer-reaching paths, also report the
+dynamic reachability funnel. These metrics recompute the best answer-reaching
+relations from the current entity frontier instead of treating one BFS path as
+the only valid oracle:
+
+```text
+answer_reaching_in_pool_rate
+answer_reaching_in_keep_rate
+answer_reaching_selected_rate
+answer_reaching_executed_top1_rate
+answer_reaching_rank_before_mean
+answer_reaching_rank_after_mean
+```
+
 Literature basis:
 
 - UniKGQA (ICLR 2023): question-relation semantic matching shared by retrieval

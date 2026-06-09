@@ -139,6 +139,7 @@ class LocalSubgraphBackend:
         self.adj = {}
         self.rev = {}
         self.names = set()
+        self._distance_cache = {}
         for s, r, o in row.get("graph") or []:
             s, r, o = str(s), str(r), str(o)
             self.adj.setdefault(s, {}).setdefault(r, [])
@@ -171,6 +172,60 @@ class LocalSubgraphBackend:
         if head:
             return list(self.adj.get(entity_id, {}).get(relation, []))
         return list(self.rev.get(entity_id, {}).get(relation, []))
+
+    def shortest_answer_distance(self, entity_id: str, max_hops: int = 6):
+        """Shortest undirected relation-step distance to any answer entity."""
+        key = (str(entity_id), int(max_hops))
+        if key in self._distance_cache:
+            return self._distance_cache[key]
+        start = str(entity_id)
+        if start in self.answers:
+            self._distance_cache[key] = 0
+            return 0
+        frontier = {start}
+        seen = {start}
+        for depth in range(1, max_hops + 1):
+            nxt = set()
+            for node in frontier:
+                for values in self.adj.get(node, {}).values():
+                    nxt.update(str(x) for x in values)
+                for values in self.rev.get(node, {}).values():
+                    nxt.update(str(x) for x in values)
+            nxt -= seen
+            if nxt & self.answers:
+                self._distance_cache[key] = depth
+                return depth
+            if not nxt:
+                break
+            seen.update(nxt)
+            frontier = nxt
+        self._distance_cache[key] = None
+        return None
+
+    def answer_reaching_relations(self, entity_id: str, remaining_steps: int):
+        """Relations that minimize reachable distance to an answer from this entity."""
+        candidates = []
+        for relation, values in self.adj.get(str(entity_id), {}).items():
+            candidates.append((relation, True, values))
+        for relation, values in self.rev.get(str(entity_id), {}).items():
+            candidates.append((relation, False, values))
+        best_distance = None
+        best_relations = set()
+        for relation, _head, values in candidates:
+            distances = [
+                self.shortest_answer_distance(str(x), max(0, remaining_steps - 1))
+                for x in values
+            ]
+            distances = [d for d in distances if d is not None]
+            if not distances:
+                continue
+            distance = 1 + min(distances)
+            if best_distance is None or distance < best_distance:
+                best_distance = distance
+                best_relations = {relation}
+            elif distance == best_distance:
+                best_relations.add(relation)
+        return best_relations
 
 
 def _abandon_rels(relation: str) -> bool:
@@ -776,6 +831,18 @@ def _relation_rank(items, target):
     return None
 
 
+def _best_relation_rank(items, targets):
+    targets = set(targets or [])
+    if not targets:
+        return None
+    ranks = [
+        i
+        for i, x in enumerate(items, start=1)
+        if (x.get("relation") if isinstance(x, dict) else str(x)) in targets
+    ]
+    return min(ranks) if ranks else None
+
+
 def _oracle_next_relation(backend: LocalSubgraphBackend, executed_prefix):
     oracle = list(backend.oracle_path or [])
     idx = len(executed_prefix)
@@ -898,7 +965,9 @@ def _print_trace(task_no, trace_record, topk):
                 f"oracle_next={ent.get('oracle_next_relation')} "
                 f"rank_before={ent.get('oracle_rank_before_rerank')} "
                 f"rank_after={ent.get('oracle_rank_after_rerank_full')} "
-                f"rank_keep={ent.get('oracle_rank_after_keep')}",
+                f"rank_keep={ent.get('oracle_rank_after_keep')} "
+                f"answer_reaching={ent.get('answer_reaching_relations')} "
+                f"dynamic_rank={ent.get('dynamic_rank_before_rerank')}->{ent.get('dynamic_rank_after_rerank_full')}->{ent.get('dynamic_rank_after_keep')}",
                 flush=True,
             )
             if ent.get("rerank"):
@@ -918,6 +987,8 @@ def _print_trace(task_no, trace_record, topk):
             f"    selected_relations={step.get('selected_relations')} "
             f"oracle_selected={step.get('oracle_selected')} "
             f"oracle_executed_top1={step.get('oracle_executed_top1')} "
+            f"dynamic_selected={step.get('dynamic_selected')} "
+            f"dynamic_executed_top1={step.get('dynamic_executed_top1')} "
             f"selected_entities={step.get('selected_entities')} reached={step.get('answer_reached')}",
             flush=True,
         )
@@ -1005,6 +1076,14 @@ def main():
     oracle_keep_hits = 0
     oracle_selected_hits = 0
     oracle_executed_hits = 0
+    dynamic_decision_steps = 0
+    dynamic_pool_hits = 0
+    dynamic_keep_hits = 0
+    dynamic_selected_hits = 0
+    dynamic_executed_hits = 0
+    dynamic_rank_before = []
+    dynamic_rank_after = []
+    dynamic_rank_keep = []
     with pred_path.open("w", encoding="utf-8") as fout, trace_path.open("w", encoding="utf-8") as ftrace:
         for task_idx, row in enumerate(tqdm(rows), start=1):
             backend = LocalSubgraphBackend(row)
@@ -1034,6 +1113,8 @@ def main():
                     if entity == "[FINISH_ID]":
                         continue
                     oracle_next = _oracle_next_relation(backend, executed)
+                    remaining_steps = max(1, args.depth - depth + 1)
+                    valid_next_relations = backend.answer_reaching_relations(entity, remaining_steps)
                     rels = relation_search_prune_local(
                         backend, entity, topic_entity[entity], pre_relations, pre_heads[i], question, args
                     )
@@ -1041,8 +1122,10 @@ def main():
                         "entity": entity,
                         "entity_name": topic_entity[entity],
                         "oracle_next_relation": oracle_next,
+                        "answer_reaching_relations": sorted(valid_next_relations),
                         "num_relations": len(rels),
                         "oracle_rank_before_rerank": _relation_rank(rels, oracle_next),
+                        "dynamic_rank_before_rerank": _best_relation_rank(rels, valid_next_relations),
                         "relations_before_rerank": _compact_relation_list(rels, topk=args.trace_topk),
                         "rerank": None,
                     }
@@ -1051,10 +1134,13 @@ def main():
                         ent_trace["rerank"] = reranker.last_debug
                         post_topk = int(args.diplan_post_rerank_topk or args.width)
                         ent_trace["oracle_rank_after_rerank_full"] = _relation_rank(rels, oracle_next)
+                        ent_trace["dynamic_rank_after_rerank_full"] = _best_relation_rank(rels, valid_next_relations)
                         rels = rels[: max(1, post_topk)]
                     else:
                         ent_trace["oracle_rank_after_rerank_full"] = ent_trace["oracle_rank_before_rerank"]
+                        ent_trace["dynamic_rank_after_rerank_full"] = ent_trace["dynamic_rank_before_rerank"]
                     ent_trace["oracle_rank_after_keep"] = _relation_rank(rels, oracle_next)
+                    ent_trace["dynamic_rank_after_keep"] = _best_relation_rank(rels, valid_next_relations)
                     oracle_rank_before_all.append(ent_trace["oracle_rank_before_rerank"])
                     oracle_rank_after_all.append(ent_trace["oracle_rank_after_rerank_full"])
                     oracle_rank_keep_all.append(ent_trace["oracle_rank_after_keep"])
@@ -1100,6 +1186,36 @@ def main():
                     oracle_after_hits += 1 if after_ranks else 0
                     oracle_keep_hits += 1 if keep_ranks else 0
 
+                dynamic_valid = set()
+                for expansion in step_trace["entity_expansions"]:
+                    dynamic_valid.update(expansion.get("answer_reaching_relations") or [])
+                if dynamic_valid:
+                    dynamic_decision_steps += 1
+                    dyn_before = [
+                        x.get("dynamic_rank_before_rerank")
+                        for x in step_trace["entity_expansions"]
+                        if x.get("dynamic_rank_before_rerank") is not None
+                    ]
+                    dyn_after = [
+                        x.get("dynamic_rank_after_rerank_full")
+                        for x in step_trace["entity_expansions"]
+                        if x.get("dynamic_rank_after_rerank_full") is not None
+                    ]
+                    dyn_keep = [
+                        x.get("dynamic_rank_after_keep")
+                        for x in step_trace["entity_expansions"]
+                        if x.get("dynamic_rank_after_keep") is not None
+                    ]
+                    step_trace["dynamic_valid_relations"] = sorted(dynamic_valid)
+                    step_trace["dynamic_step_rank_before"] = min(dyn_before) if dyn_before else None
+                    step_trace["dynamic_step_rank_after"] = min(dyn_after) if dyn_after else None
+                    step_trace["dynamic_step_rank_keep"] = min(dyn_keep) if dyn_keep else None
+                    dynamic_rank_before.append(step_trace["dynamic_step_rank_before"])
+                    dynamic_rank_after.append(step_trace["dynamic_step_rank_after"])
+                    dynamic_rank_keep.append(step_trace["dynamic_step_rank_keep"])
+                    dynamic_pool_hits += 1 if dyn_before else 0
+                    dynamic_keep_hits += 1 if dyn_keep else 0
+
                 total_candidates, total_scores, total_relations = [], [], []
                 total_entities_id, total_topic_entities, total_head = [], [], []
                 for ent in current_entity_relations_list:
@@ -1139,9 +1255,14 @@ def main():
                 step_trace["oracle_executed_top1"] = bool(
                     pre_relations and step_trace["oracle_next_relation"] == pre_relations[0]
                 )
+                dynamic_valid = set(step_trace.get("dynamic_valid_relations") or [])
+                step_trace["dynamic_selected"] = bool(dynamic_valid & set(pre_relations))
+                step_trace["dynamic_executed_top1"] = bool(pre_relations and pre_relations[0] in dynamic_valid)
                 oracle_selected_all.append(1.0 if step_trace["oracle_selected"] else 0.0)
                 oracle_selected_hits += 1 if step_trace["oracle_selected"] else 0
                 oracle_executed_hits += 1 if step_trace["oracle_executed_top1"] else 0
+                dynamic_selected_hits += 1 if step_trace["dynamic_selected"] else 0
+                dynamic_executed_hits += 1 if step_trace["dynamic_executed_top1"] else 0
                 if pre_relations:
                     executed.append(pre_relations[0])
                 cluster_chain_of_entities.append(chain_of_entities)
@@ -1193,6 +1314,14 @@ def main():
         "oracle_step_rank_before_mean": _mean_or_none(oracle_step_rank_before),
         "oracle_step_rank_after_mean": _mean_or_none(oracle_step_rank_after),
         "oracle_step_rank_keep_mean": _mean_or_none(oracle_step_rank_keep),
+        "dynamic_decision_steps": dynamic_decision_steps,
+        "answer_reaching_in_pool_rate": dynamic_pool_hits / max(1, dynamic_decision_steps),
+        "answer_reaching_in_keep_rate": dynamic_keep_hits / max(1, dynamic_decision_steps),
+        "answer_reaching_selected_rate": dynamic_selected_hits / max(1, dynamic_decision_steps),
+        "answer_reaching_executed_top1_rate": dynamic_executed_hits / max(1, dynamic_decision_steps),
+        "answer_reaching_rank_before_mean": _mean_or_none(dynamic_rank_before),
+        "answer_reaching_rank_after_mean": _mean_or_none(dynamic_rank_after),
+        "answer_reaching_rank_keep_mean": _mean_or_none(dynamic_rank_keep),
     }
     if reranker:
         summary.update(reranker.diagnostics())
