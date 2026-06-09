@@ -704,6 +704,67 @@ def answer_reached(backend: LocalSubgraphBackend, entity_ids) -> bool:
     return bool(set(str(x) for x in entity_ids) & backend.answers)
 
 
+def relation_first_select(
+    total_entities_id,
+    total_relations,
+    total_candidates,
+    total_topic_entities,
+    total_head,
+    total_scores,
+    relation_scores,
+    args,
+):
+    """Select relations before entities so entity pruning cannot erase a good action.
+
+    Official ToG's entity_prune ranks entity candidates directly. That is faithful,
+    but for ToG-DiPLaN diagnostics it can hide whether relation-level planning
+    helped: an oracle relation can be ranked high, expanded, then disappear because
+    its entities receive weaker local entity scores. This mode first keeps diverse
+    high-scoring relations, then attaches the best entity for each kept relation.
+    """
+    groups = {}
+    for eid, rel, cand, topic, head, ent_score in zip(
+        total_entities_id,
+        total_relations,
+        total_candidates,
+        total_topic_entities,
+        total_head,
+        total_scores,
+    ):
+        key = (rel, bool(head))
+        rel_score = float(relation_scores.get(key, relation_scores.get(rel, ent_score)))
+        item = {
+            "entity_id": eid,
+            "relation": rel,
+            "candidate": cand,
+            "topic_entity": topic,
+            "head": bool(head),
+            "entity_score": float(ent_score),
+            "relation_score": rel_score,
+        }
+        groups.setdefault(key, []).append(item)
+    if not groups:
+        return False, [], [], [], []
+
+    selected = []
+    for items in groups.values():
+        best_entity = max(items, key=lambda x: (x["entity_score"], x["relation_score"]))
+        selected.append(best_entity)
+    selected.sort(key=lambda x: (x["relation_score"], x["entity_score"]), reverse=True)
+    selected = selected[: max(1, int(args.num_retain_entity))]
+
+    chain_of_entities = [x["candidate"] for x in selected]
+    entities_id = [x["entity_id"] for x in selected]
+    pre_relations = [x["relation"] for x in selected]
+    pre_heads = [x["head"] for x in selected]
+    return True, chain_of_entities, entities_id, pre_relations, pre_heads
+
+
+def _mean_or_none(xs):
+    vals = [float(x) for x in xs if x is not None]
+    return mean(vals) if vals else None
+
+
 def _str2bool(x):
     if isinstance(x, bool):
         return x
@@ -766,6 +827,7 @@ def main():
     parser.add_argument("--num_retain_entity", type=int, default=5)
     parser.add_argument("--prune_tools", type=str, default="llm")
     parser.add_argument("--planning_strategy", type=str, default="tog_diplan", choices=["tog", "tog_diplan"])
+    parser.add_argument("--selection_mode", type=str, default="entity_prune", choices=["entity_prune", "relation_first"])
     parser.add_argument("--diplan_repo", default="/root/autodl-tmp/DiPLaN")
     parser.add_argument("--diplan_ae_ckpt", default="")
     parser.add_argument("--diplan_planner_ckpt", default="")
@@ -792,6 +854,10 @@ def main():
     pred_path = Path(args.out) / "predictions.jsonl"
     trace_path = Path(args.out) / "trace.jsonl"
     records = []
+    oracle_rank_before_all = []
+    oracle_rank_after_all = []
+    oracle_rank_keep_all = []
+    oracle_selected_all = []
     with pred_path.open("w", encoding="utf-8") as fout, trace_path.open("w", encoding="utf-8") as ftrace:
         for task_idx, row in enumerate(tqdm(rows), start=1):
             backend = LocalSubgraphBackend(row)
@@ -810,6 +876,7 @@ def main():
 
             for depth in range(1, args.depth + 1):
                 current_entity_relations_list = []
+                current_relation_scores = {}
                 step_trace = {
                     "depth": depth,
                     "topic_entities": dict(topic_entity),
@@ -841,8 +908,21 @@ def main():
                     else:
                         ent_trace["oracle_rank_after_rerank_full"] = ent_trace["oracle_rank_before_rerank"]
                     ent_trace["oracle_rank_after_keep"] = _relation_rank(rels, oracle_next)
+                    oracle_rank_before_all.append(ent_trace["oracle_rank_before_rerank"])
+                    oracle_rank_after_all.append(ent_trace["oracle_rank_after_rerank_full"])
+                    oracle_rank_keep_all.append(ent_trace["oracle_rank_after_keep"])
                     ent_trace["kept_after_rerank"] = _compact_relation_list(rels, topk=args.trace_topk)
                     step_trace["entity_expansions"].append(ent_trace)
+                    for ent_rel in rels:
+                        key = (ent_rel["relation"], bool(ent_rel["head"]))
+                        current_relation_scores[key] = max(
+                            float(current_relation_scores.get(key, -1e18)),
+                            float(ent_rel.get("score", 0.0)),
+                        )
+                        current_relation_scores[ent_rel["relation"]] = max(
+                            float(current_relation_scores.get(ent_rel["relation"], -1e18)),
+                            float(ent_rel.get("score", 0.0)),
+                        )
                     current_entity_relations_list.extend(rels)
 
                 total_candidates, total_scores, total_relations = [], [], []
@@ -865,15 +945,23 @@ def main():
                     step_trace["stopped"] = "no_total_candidates"
                     trace_steps.append(step_trace)
                     break
-                flag, chain_of_entities, entities_id, pre_relations, pre_heads = entity_prune(
-                    total_entities_id, total_relations, total_candidates,
-                    total_topic_entities, total_head, total_scores, args
-                )
+                if args.selection_mode == "relation_first":
+                    flag, chain_of_entities, entities_id, pre_relations, pre_heads = relation_first_select(
+                        total_entities_id, total_relations, total_candidates,
+                        total_topic_entities, total_head, total_scores,
+                        current_relation_scores, args,
+                    )
+                else:
+                    flag, chain_of_entities, entities_id, pre_relations, pre_heads = entity_prune(
+                        total_entities_id, total_relations, total_candidates,
+                        total_topic_entities, total_head, total_scores, args
+                    )
                 step_trace["selected_relations"] = list(pre_relations)
                 step_trace["selected_entities"] = list(entities_id)
                 step_trace["selected_heads"] = list(pre_heads)
                 step_trace["oracle_next_relation"] = _oracle_next_relation(backend, executed)
                 step_trace["oracle_selected"] = bool(step_trace["oracle_next_relation"] in set(pre_relations))
+                oracle_selected_all.append(1.0 if step_trace["oracle_selected"] else 0.0)
                 if pre_relations:
                     executed.append(pre_relations[0])
                 cluster_chain_of_entities.append(chain_of_entities)
@@ -909,6 +997,11 @@ def main():
         "hits@1": mean([1.0 if r["success"] else 0.0 for r in records]) if records else 0.0,
         "trap@1": mean([1.0 if r["trap_at_1"] else 0.0 for r in records]) if records else 0.0,
         "first_error_step": mean([r["first_error_step"] for r in records]) if records else 0.0,
+        "selection_mode": args.selection_mode,
+        "oracle_rank_before_mean": _mean_or_none(oracle_rank_before_all),
+        "oracle_rank_after_mean": _mean_or_none(oracle_rank_after_all),
+        "oracle_rank_keep_mean": _mean_or_none(oracle_rank_keep_all),
+        "oracle_selected_rate": mean(oracle_selected_all) if oracle_selected_all else 0.0,
     }
     if reranker:
         summary.update(reranker.diagnostics())
