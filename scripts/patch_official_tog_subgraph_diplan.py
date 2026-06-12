@@ -128,6 +128,41 @@ def _as_list(x):
     return list(x)
 
 
+def _env_enabled(name: str, default: str = "0") -> bool:
+    import os
+
+    return str(os.environ.get(name, default)).lower() in {"1", "true", "yes", "on"}
+
+
+def _env_int(name: str, default: int) -> int:
+    import os
+
+    try:
+        return int(os.environ.get(name, str(default)))
+    except Exception:
+        return int(default)
+
+
+def _score_voted_entities(entity_ids, scores, topk: int):
+    """Aggregate duplicated entity candidates without peeking at gold answers."""
+    aggregate = {}
+    first_pos = {}
+    for pos, (entity_id, score) in enumerate(zip(entity_ids or [], scores or [])):
+        entity_id = str(entity_id)
+        aggregate[entity_id] = aggregate.get(entity_id, 0.0) + float(score)
+        first_pos.setdefault(entity_id, pos)
+    ranked = sorted(aggregate, key=lambda x: (-aggregate[x], first_pos[x], x))
+    return ranked[: max(1, int(topk))]
+
+
+def _is_diplan_strategy(args) -> bool:
+    return str(getattr(args, "planning_strategy", "tog")) in {"tog_diplan", "pog_diplan"}
+
+
+def _is_pog_strategy(args) -> bool:
+    return str(getattr(args, "planning_strategy", "tog")) in {"pog", "pog_diplan"}
+
+
 class LocalSubgraphBackend:
     def __init__(self, row: dict):
         self.row = row
@@ -255,7 +290,8 @@ def relation_search_prune_local(backend: LocalSubgraphBackend, entity_id, entity
     max_prompt_relations = int(getattr(args, "max_prompt_relations", 64))
     prompt_relations = sorted(total_relations, key=lambda r: (-_overlap(relation_label(r), question), r))[:max_prompt_relations]
     rerank_pool_size = 0
-    if getattr(args, "planning_strategy", "tog") == "tog_diplan":
+    pool_strategy = str(getattr(args, "diplan_pool_strategy", "lexical"))
+    if _is_diplan_strategy(args):
         rerank_pool_size = int(getattr(args, "diplan_rerank_pool_size", 0))
     if args.prune_tools == "llm":
         # Use official ToG relation-prune prompt, but expose human-readable labels
@@ -271,21 +307,31 @@ def relation_search_prune_local(backend: LocalSubgraphBackend, entity_id, entity
             if flag:
                 if rerank_pool_size > args.width:
                     return _expand_relation_pool(
-                        entity_id, rels, total_relations, head_relations, question, rerank_pool_size
+                        entity_id,
+                        rels,
+                        total_relations,
+                        head_relations,
+                        question,
+                        rerank_pool_size,
+                        pool_strategy=pool_strategy,
                     )
                 return rels
         except Exception as exc:
             print(f"[ToG relation prune] LLM failed, fallback to lexical: {exc}", flush=True)
     # Deterministic fallback: relation-label lexical overlap.
-    limit = rerank_pool_size if rerank_pool_size > args.width else args.width
-    ranked = sorted(total_relations, key=lambda r: (-_overlap(relation_label(r), question), r))[: limit]
+    if pool_strategy == "all_legal" and rerank_pool_size > 0:
+        limit = min(len(total_relations), rerank_pool_size)
+    else:
+        limit = rerank_pool_size if rerank_pool_size > args.width else args.width
+    ranked_all = _rank_pool_relations(total_relations, question, pool_strategy)
+    ranked = ranked_all[: limit]
     return [
         {"entity": entity_id, "relation": r, "score": 1.0 / (i + 1), "head": r in head_relations}
         for i, r in enumerate(ranked)
     ]
 
 
-def _expand_relation_pool(entity_id, seed_rels, total_relations, head_relations, question, pool_size):
+def _expand_relation_pool(entity_id, seed_rels, total_relations, head_relations, question, pool_size, pool_strategy="lexical"):
     """Let ToG build the action space, then expose a larger legal pool to DiPLaN.
 
     Original ToG often returns only ``width`` relations (e.g. 3). If DiPLaN only
@@ -307,7 +353,7 @@ def _expand_relation_pool(entity_id, seed_rels, total_relations, head_relations,
         cc.setdefault("head", rel in head_relations)
         out.append(cc)
         seen.add(rel)
-    ranked = sorted(total_relations, key=lambda r: (-_overlap(relation_label(r), question), r))
+    ranked = _rank_pool_relations(total_relations, question, pool_strategy)
     for j, rel in enumerate(ranked):
         if len(out) >= pool_size:
             break
@@ -321,6 +367,14 @@ def _expand_relation_pool(entity_id, seed_rels, total_relations, head_relations,
         })
         seen.add(rel)
     return out
+
+
+def _rank_pool_relations(relations, question, pool_strategy="lexical"):
+    if pool_strategy == "all_legal":
+        # High-recall mode inspired by relation-exploration KGQA: do not let
+        # lexical/LLM pruning become a hard bottleneck before learned reranking.
+        return sorted(relations)
+    return sorted(relations, key=lambda r: (-_overlap(relation_label(r), question), r))
 
 
 def _overlap(text: str, question: str) -> float:
@@ -352,6 +406,10 @@ class DiPLaNReranker:
         self.value_std_sum = 0.0
         self.prior_std_sum = 0.0
         self.question_std_sum = 0.0
+        self.guided_std_sum = 0.0
+        self.candidate_diffusion_std_sum = 0.0
+        self.trajectory_diffusion_std_sum = 0.0
+        self.fusion_std_sum = 0.0
         self.prior_nonzero_calls = 0
         self.embedding_coverage_sum = 0.0
         if not self.enabled:
@@ -360,10 +418,16 @@ class DiPLaNReranker:
         from src.diplan.planners import load_diffusion_bundle
         from src.diplan.inference import sample_plan_candidates, score_candidates_with_value
         from src.diplan.relation_scorer import load_relation_scorer, score_relations
+        from src.diplan.candidate_diffusion import load_candidate_diffusion, score_candidate_relations
+        from src.diplan.fusion_ranker import load_fusion_ranker, score_fusion
+        from src.diplan.trajectory_diffusion import load_trajectory_diffusion, score_first_relations
 
         self.sample_plan_candidates = sample_plan_candidates
         self.score_candidates_with_value = score_candidates_with_value
         self.score_relations = score_relations
+        self.score_candidate_relations = score_candidate_relations
+        self.score_fusion = score_fusion
+        self.score_first_relations = score_first_relations
         self.bundle = load_diffusion_bundle(args.diplan_ae_ckpt, args.diplan_planner_ckpt, args.diplan_value_ckpt, {
             "diffusion": {
                 "num_candidates": args.diplan_num_candidates,
@@ -373,12 +437,27 @@ class DiPLaNReranker:
             }
         })
         self.value_weight = float(args.diplan_value_weight)
+        self.planning_strategy = str(args.planning_strategy)
         self.prior_weight = float(args.diplan_prior_weight)
         self.score_mode = str(args.diplan_score_mode)
         self.question_weight = float(args.diplan_question_weight)
+        self.schema_prior_weight = float(args.diplan_schema_prior_weight)
+        self.guided_weight = float(args.diplan_guided_weight)
+        self.candidate_diffusion_weight = float(args.diplan_candidate_diffusion_weight)
+        self.candidate_guidance_scale = float(args.diplan_candidate_guidance_scale)
+        self.trajectory_diffusion_weight = float(args.diplan_trajectory_diffusion_weight)
+        self.trajectory_guidance_scale = float(args.diplan_trajectory_guidance_scale)
         self.first_step_bonus = float(args.diplan_first_step_bonus)
         self.future_step_bonus = float(args.diplan_future_step_bonus)
         self.prior_min_jaccard = float(args.diplan_prior_min_jaccard)
+        self.guided_rollouts = int(args.diplan_guided_rollouts)
+        self.guided_topk = int(args.diplan_guided_topk)
+        self.guided_temperature = float(args.diplan_guided_temperature)
+        self.guided_risk_beta = float(args.diplan_guided_risk_beta)
+        self.pog_guidance_weight = float(args.pog_guidance_weight)
+        self.pog_memory_weight = float(args.pog_memory_weight)
+        self.pog_reflection_weight = float(args.pog_reflection_weight)
+        self.pog_fanout_penalty = float(args.pog_fanout_penalty)
         self.horizon = int(args.diplan_horizon)
         self.planner_type = str(getattr(self.bundle, "planner_type", "unknown"))
         self.path_embedding = _find_embedding_weight(self.bundle.autoencoder)
@@ -388,7 +467,25 @@ class DiPLaNReranker:
             if args.diplan_relation_scorer_ckpt
             else None
         )
+        self.candidate_diffusion = (
+            load_candidate_diffusion(args.diplan_candidate_diffusion_ckpt)
+            if args.diplan_candidate_diffusion_ckpt
+            else None
+        )
+        self.trajectory_diffusion = (
+            load_trajectory_diffusion(args.diplan_trajectory_diffusion_ckpt)
+            if args.diplan_trajectory_diffusion_ckpt
+            else None
+        )
+        self.fusion_ranker = (
+            load_fusion_ranker(args.diplan_fusion_ckpt)
+            if args.diplan_fusion_ckpt
+            else None
+        )
         self.question_prior_mode = "learned_contrastive" if self.relation_scorer is not None else "schema_fallback"
+        self.candidate_diffusion_mode = "candidate_d3pm" if self.candidate_diffusion is not None else "disabled"
+        self.trajectory_diffusion_mode = "trajectory_d3pm" if self.trajectory_diffusion is not None else "disabled"
+        self.fusion_mode = "learned_fusion" if self.fusion_ranker is not None else "disabled"
         self.last_debug = None
 
     def rerank(self, backend: LocalSubgraphBackend, candidates, executed_prefix):
@@ -415,9 +512,15 @@ class DiPLaNReranker:
         )
         self.value_std_sum += _std(raw_value_scores)
         value_scores = _z_norm(raw_value_scores)
+        fusion_feature_names = list(getattr(self.fusion_ranker, "feature_names", []) or [])
+        needs_prior_scores = (
+            self.prior_weight != 0.0
+            or self.score_mode in {"prior_only", "prior_value"}
+            or "prior_z" in fusion_feature_names
+        )
         prior_scores = [0.0 for _ in candidates]
         sampled_paths = []
-        if self.prior_weight != 0.0:
+        if needs_prior_scores:
             sampled_paths = self.sample_plan_candidates(
                 planner=self.bundle.planner,
                 autoencoder=self.bundle.autoencoder,
@@ -459,35 +562,161 @@ class DiPLaNReranker:
             )
         else:
             raw_question_scores = [
-                _question_conditioned_relation_score(backend.question, c["relation"])
+                _question_conditioned_relation_score(backend.question, c["relation"], executed_prefix)
                 for c in candidates
+            ]
+        if self.schema_prior_weight != 0.0:
+            schema_scores = [
+                _question_conditioned_relation_score(backend.question, c["relation"], executed_prefix)
+                for c in candidates
+            ]
+            raw_question_scores = [
+                float(x) + self.schema_prior_weight * float(s)
+                for x, s in zip(raw_question_scores, schema_scores)
             ]
         self.question_std_sum += _std(raw_question_scores)
         question_scores = _z_norm(raw_question_scores)
+        if self.candidate_diffusion is not None:
+            raw_candidate_diffusion_scores = self.score_candidate_relations(
+                self.candidate_diffusion,
+                backend.question,
+                query_tokens,
+                [c["relation"] for c in candidates],
+                executed_prefix=executed_prefix,
+            )
+        else:
+            raw_candidate_diffusion_scores = [0.0 for _ in candidates]
+        self.candidate_diffusion_std_sum += _std(raw_candidate_diffusion_scores)
+        candidate_diffusion_scores = _z_norm(raw_candidate_diffusion_scores)
+        if self.trajectory_diffusion is not None:
+            raw_trajectory_diffusion_scores = self.score_first_relations(
+                self.trajectory_diffusion,
+                backend.question,
+                query_tokens,
+                [c["relation"] for c in candidates],
+                executed_prefix=executed_prefix,
+                guidance_scale=self.trajectory_guidance_scale,
+            )
+        else:
+            raw_trajectory_diffusion_scores = [0.0 for _ in candidates]
+        self.trajectory_diffusion_std_sum += _std(raw_trajectory_diffusion_scores)
+        trajectory_diffusion_scores = _z_norm(raw_trajectory_diffusion_scores)
         combined_prior_scores = _z_norm([
             float(p) + self.question_weight * float(q)
             for p, q in zip(prior_scores, question_scores)
         ])
+        guided_paths, guided_state_paths, raw_guided_scores, guided_value_stats = self._guided_rollout_scores(
+            backend,
+            candidates,
+            executed_prefix,
+            query_tokens,
+        )
+        self.guided_std_sum += _std(raw_guided_scores)
+        guided_scores = _z_norm(raw_guided_scores)
+        fusion_features = _fusion_features(
+            backend,
+            candidates,
+            executed_prefix,
+            self.horizon,
+            value_scores,
+            question_scores,
+            candidate_diffusion_scores,
+            trajectory_diffusion_scores,
+            prior_scores,
+            guided_scores,
+            feature_names=fusion_feature_names,
+        )
+        if self.fusion_ranker is not None:
+            raw_fusion_scores = self.score_fusion(self.fusion_ranker, fusion_features)
+        else:
+            raw_fusion_scores = [0.0 for _ in candidates]
+        self.fusion_std_sum += _std(raw_fusion_scores)
+        fusion_scores = _z_norm(raw_fusion_scores)
         out = []
-        for c, v, p, q, cp in zip(candidates, value_scores, prior_scores, question_scores, combined_prior_scores):
+        for c, v, p, q, cp, g, cd, td, fs in zip(
+            candidates,
+            value_scores,
+            prior_scores,
+            question_scores,
+            combined_prior_scores,
+            guided_scores,
+            candidate_diffusion_scores,
+            trajectory_diffusion_scores,
+            fusion_scores,
+        ):
             cc = dict(c)
             base = float(cc["score"])
             cc["diplan_value_score"] = float(v)
             cc["diplan_prior_score"] = float(p)
             cc["diplan_question_score"] = float(q)
             cc["diplan_combined_prior_score"] = float(cp)
+            cc["diplan_guided_score"] = float(g)
+            cc["diplan_candidate_diffusion_score"] = float(cd)
+            cc["diplan_trajectory_diffusion_score"] = float(td)
+            cc["diplan_fusion_score"] = float(fs)
             if self.score_mode == "tog_only":
                 cc["score"] = base
             elif self.score_mode == "value_only":
                 cc["score"] = float(v) + 1e-4 * base
             elif self.score_mode == "question_only":
                 cc["score"] = float(q) + 1e-4 * base
+            elif self.score_mode == "candidate_diffusion":
+                cc["score"] = float(cd) + 1e-4 * base
+            elif self.score_mode == "value_candidate_diffusion":
+                cc["score"] = (
+                    self.value_weight * float(v)
+                    + self.candidate_diffusion_weight * float(cd)
+                    + self.question_weight * float(q)
+                    + 1e-4 * base
+                )
+            elif self.score_mode == "trajectory_diffusion":
+                cc["score"] = float(td) + 1e-4 * base
+            elif self.score_mode == "value_trajectory_diffusion":
+                cc["score"] = (
+                    self.value_weight * float(v)
+                    + self.trajectory_diffusion_weight * float(td)
+                    + self.question_weight * float(q)
+                    + 1e-4 * base
+                )
+            elif self.score_mode == "learned_fusion":
+                cc["score"] = float(fs) + 1e-4 * base
+            elif self.score_mode == "value_learned_fusion":
+                cc["score"] = self.value_weight * float(v) + float(fs) + 1e-4 * base
+            elif self.score_mode == "guided":
+                cc["score"] = float(g) + 1e-4 * base
+            elif self.score_mode == "guided_value":
+                cc["score"] = self.value_weight * float(v) + self.guided_weight * float(g) + 1e-4 * base
+            elif self.score_mode == "value_guided":
+                cc["score"] = (
+                    self.value_weight * float(v)
+                    + self.guided_weight * float(g)
+                    + self.question_weight * float(q)
+                    + 1e-4 * base
+                )
             elif self.score_mode == "prior_only":
                 cc["score"] = float(cp) + 1e-4 * base
             elif self.score_mode == "prior_value":
                 cc["score"] = self.value_weight * float(v) + self.prior_weight * float(cp) + 1e-4 * base
             else:
                 cc["score"] = base + self.value_weight * float(v) + self.prior_weight * float(cp)
+            if self.planning_strategy == "pog_diplan":
+                pog_guidance, pog_memory, pog_reflection = _pog_relation_signals(
+                    backend,
+                    cc,
+                    executed_prefix,
+                    remaining_horizon=max(1, self.horizon - len(executed_prefix)),
+                    fanout_penalty=self.pog_fanout_penalty,
+                )
+                pog_score = (
+                    self.pog_guidance_weight * float(pog_guidance)
+                    + self.pog_memory_weight * float(pog_memory)
+                    + self.pog_reflection_weight * float(pog_reflection)
+                )
+                cc["pog_guidance_score"] = float(pog_guidance)
+                cc["pog_memory_score"] = float(pog_memory)
+                cc["pog_reflection_score"] = float(pog_reflection)
+                cc["pog_score"] = float(pog_score)
+                cc["score"] = float(cc["score"]) + float(pog_score)
             out.append(cc)
         out = sorted(out, key=lambda x: x["score"], reverse=True)
         if out and out[0]["relation"] != original_top:
@@ -497,13 +726,156 @@ class DiPLaNReranker:
             "before_top": before_top,
             "after_top": _compact_relation_list(out, topk=8),
             "sampled_paths_top": sampled_paths[:5],
+            "guided_paths_top": guided_paths[:5],
+            "guided_state_paths_top": guided_state_paths[:3],
+            "guided_value_stats_top": guided_value_stats[:5],
             "value_std": _std(raw_value_scores),
             "prior_std": _std(prior_scores),
             "question_std": _std(raw_question_scores),
+            "guided_std": _std(raw_guided_scores),
+            "candidate_diffusion_std": _std(raw_candidate_diffusion_scores),
+            "trajectory_diffusion_std": _std(raw_trajectory_diffusion_scores),
+            "fusion_std": _std(raw_fusion_scores),
             "embedding_coverage": emb_cov,
             "top_changed": bool(out and out[0]["relation"] != original_top),
         }
         return out
+
+    def _guided_rollout_scores(self, backend, candidates, executed_prefix, query_tokens):
+        """Candidate-conditioned trajectory guidance.
+
+        This is a lightweight Diffuser-style inpainting step: ToG fixes the legal
+        first action, then we roll out a short future trajectory with the learned
+        question-relation prior as guidance and score the resulting full path.
+        """
+        guided_paths = []
+        guided_state_paths = []
+        rollout_owner = []
+        n_rollouts = max(1, self.guided_rollouts)
+        for cand_idx, cand in enumerate(candidates):
+            for rollout_idx in range(n_rollouts):
+                path = list(executed_prefix) + [cand["relation"]]
+                first_frontier = set(backend.entity_search(cand["entity"], cand["relation"], bool(cand["head"])))
+                state_path = [
+                    {
+                        "entity": cand["entity"],
+                        "relation": cand["relation"],
+                        "head": bool(cand["head"]),
+                        "next_entities": sorted(first_frontier)[:5],
+                    }
+                ]
+                frontier = set(first_frontier)
+                seen_states = set(frontier)
+                for _ in range(max(0, self.horizon - 1)):
+                    if not frontier:
+                        break
+                    relation_options = []
+                    for entity in sorted(frontier):
+                        heads, tails = backend.relations(entity, [], -1, remove_unnecessary=True)
+                        relation_options.extend((entity, rel, True) for rel in heads)
+                        relation_options.extend((entity, rel, False) for rel in tails)
+                    if not relation_options:
+                        break
+                    relation_options = _dedupe_relation_options(relation_options)
+                    relation_ids = [rel for _entity, rel, _head in relation_options]
+                    if self.relation_scorer is not None:
+                        option_scores = self.score_relations(
+                            self.relation_scorer,
+                            backend.question,
+                            query_tokens,
+                            relation_ids,
+                            executed_prefix=path,
+                        )
+                    else:
+                        option_scores = [
+                            _question_conditioned_relation_score(backend.question, rel, path)
+                            for rel in relation_ids
+                        ]
+                    ranked = sorted(
+                        zip(relation_options, option_scores),
+                        key=lambda x: (float(x[1]), x[0][1]),
+                        reverse=True,
+                    )
+                    topk = max(1, min(self.guided_topk, len(ranked)))
+                    chosen_option, chosen_score = _sample_ranked_option(
+                        ranked[:topk],
+                        temperature=self.guided_temperature,
+                        rng_seed=(self.calls * 1000003 + cand_idx * 9176 + rollout_idx),
+                    )
+                    best_entity, best_rel, best_head = chosen_option
+                    path.append(best_rel)
+                    next_frontier = set(backend.entity_search(best_entity, best_rel, bool(best_head)))
+                    next_frontier -= seen_states
+                    state_path.append(
+                        {
+                            "entity": best_entity,
+                            "relation": best_rel,
+                            "head": bool(best_head),
+                            "score": float(chosen_score),
+                            "next_entities": sorted(next_frontier)[:5],
+                        }
+                    )
+                    if not next_frontier:
+                        break
+                    seen_states.update(next_frontier)
+                    frontier = next_frontier
+                guided_paths.append(path)
+                guided_state_paths.append(state_path)
+                rollout_owner.append(cand_idx)
+        rollout_values = self.score_candidates_with_value(
+            self.bundle.value_model,
+            self.bundle.path_vocab,
+            self.bundle.query_vocab,
+            query_tokens,
+            guided_paths,
+            self.bundle.device,
+            max_query_len=32,
+            max_path_len=30,
+        )
+        immediate = [
+            _question_conditioned_relation_score(backend.question, c["relation"], executed_prefix)
+            for c in candidates
+        ]
+        if self.relation_scorer is not None:
+            immediate = self.score_relations(
+                self.relation_scorer,
+                backend.question,
+                query_tokens,
+                [c["relation"] for c in candidates],
+                executed_prefix=executed_prefix,
+            )
+            if self.schema_prior_weight != 0.0:
+                schema_scores = [
+                    _question_conditioned_relation_score(backend.question, c["relation"], executed_prefix)
+                    for c in candidates
+                ]
+                immediate = [
+                    float(x) + self.schema_prior_weight * float(s)
+                    for x, s in zip(immediate, schema_scores)
+                ]
+        grouped_values = [[] for _ in candidates]
+        for owner, value in zip(rollout_owner, rollout_values):
+            grouped_values[owner].append(float(value))
+        raw = []
+        stats = []
+        for vals, q in zip(grouped_values, immediate):
+            if not vals:
+                vals = [0.0]
+            mean_v = mean(vals)
+            max_v = max(vals)
+            std_v = _std(vals)
+            risk_adjusted = mean_v - self.guided_risk_beta * std_v
+            raw.append(risk_adjusted + self.question_weight * float(q))
+            stats.append(
+                {
+                    "mean": float(mean_v),
+                    "max": float(max_v),
+                    "std": float(std_v),
+                    "risk_adjusted": float(risk_adjusted),
+                    "n": len(vals),
+                }
+            )
+        return guided_paths, guided_state_paths, raw, stats
 
     def diagnostics(self):
         denom = max(1, self.calls)
@@ -512,6 +884,9 @@ class DiPLaNReranker:
             "diplan_planner_type": getattr(self, "planner_type", "disabled"),
             "diplan_projection_mode": getattr(self, "projection_mode", "disabled"),
             "diplan_question_prior_mode": getattr(self, "question_prior_mode", "disabled"),
+            "diplan_candidate_diffusion_mode": getattr(self, "candidate_diffusion_mode", "disabled"),
+            "diplan_trajectory_diffusion_mode": getattr(self, "trajectory_diffusion_mode", "disabled"),
+            "diplan_fusion_mode": getattr(self, "fusion_mode", "disabled"),
             "diplan_score_mode": getattr(self, "score_mode", "disabled"),
             "diplan_rerank_calls": self.calls,
             "diplan_avg_candidates_per_call": self.candidate_count_sum / denom,
@@ -519,12 +894,24 @@ class DiPLaNReranker:
             "diplan_value_std_mean": self.value_std_sum / denom,
             "diplan_prior_std_mean": self.prior_std_sum / denom,
             "diplan_question_std_mean": self.question_std_sum / denom,
+            "diplan_guided_std_mean": self.guided_std_sum / denom,
+            "diplan_candidate_diffusion_std_mean": self.candidate_diffusion_std_sum / denom,
+            "diplan_trajectory_diffusion_std_mean": self.trajectory_diffusion_std_sum / denom,
+            "diplan_fusion_std_mean": self.fusion_std_sum / denom,
             "diplan_prior_nonzero_rate": self.prior_nonzero_calls / denom,
             "diplan_embedding_coverage_mean": self.embedding_coverage_sum / denom,
         }
 
 
-def _candidate_diffusion_prior(relations, sampled_paths, first_bonus=1.0, future_bonus=0.35, min_jaccard=0.2):
+def _candidate_diffusion_prior(
+    relations,
+    sampled_paths,
+    first_bonus=1.0,
+    future_bonus=0.35,
+    min_jaccard=0.2,
+    path_vocab=None,
+    path_embedding=None,
+):
     """Soft-project diffusion trajectories back onto ToG's legal candidate actions.
 
     Diffusion is allowed to imagine a global future path, but the executed action
@@ -537,8 +924,8 @@ def _candidate_diffusion_prior(relations, sampled_paths, first_bonus=1.0, future
         first_bonus=first_bonus,
         future_bonus=future_bonus,
         min_jaccard=min_jaccard,
-        path_vocab=None,
-        path_embedding=None,
+        path_vocab=path_vocab,
+        path_embedding=path_embedding,
     )
 
 
@@ -691,7 +1078,7 @@ def _semantic_relation_similarity(a: str, b: str) -> float:
     return score
 
 
-def _question_conditioned_relation_score(question: str, relation: str) -> float:
+def _question_conditioned_relation_score(question: str, relation: str, executed_prefix=None) -> float:
     """Lightweight schema-intent prior P(relation | question).
 
     The learned AE prior often captures entity-type neighborhoods (person ->
@@ -703,6 +1090,11 @@ def _question_conditioned_relation_score(question: str, relation: str) -> float:
     """
     q = " " + " ".join(_relation_tokens_norm(question)) + " "
     r = " " + " ".join(_relation_tokens_norm(relation)) + " "
+    prefix = " " + " ".join(
+        tok
+        for rel in (executed_prefix or [])
+        for tok in _relation_tokens_norm(str(rel))
+    ) + " "
 
     def has_any(text, toks):
         return any(f" {t} " in text for t in toks)
@@ -747,6 +1139,48 @@ def _question_conditioned_relation_score(question: str, relation: str) -> float:
         if has_any(r, ["containedby", "contains", "location", "place"]):
             score += 0.8
 
+    # Prefix-aware second-hop schema alignment. These are transparent priors over
+    # legal actions, not answer peeking: they encode common WebQSP/CWQ wording ->
+    # Freebase schema intents that the neural scorer often confuses with broad
+    # entity-type neighborhoods.
+    if has_any(q, ["school", "highschool", "college", "university", "attend", "attended"]):
+        if has_any(prefix, ["education"]):
+            if has_any(r, ["institution", "school", "university", "college"]):
+                score += 3.0
+            if has_any(r, ["degree", "major", "field"]):
+                score += 0.8
+            if has_any(r, ["award", "nomination", "nominated"]):
+                score -= 2.0
+
+    if has_any(q, ["play", "played", "team", "club", "first"]):
+        if has_any(prefix, ["athlete", "team", "roster", "sport"]):
+            if has_any(r, ["team", "roster", "club"]):
+                score += 3.0
+            if has_any(r, ["film", "music", "character", "direct"]):
+                score -= 2.0
+
+    if has_any(q, ["flower", "symbol", "bird", "flag", "motto"]):
+        if has_any(prefix, ["symbol", "official"]):
+            if has_any(r, ["symbol"]):
+                score += 3.0
+            if has_any(r, ["relationship"]):
+                score += 1.0
+            if has_any(r, ["named", "after", "namesake"]):
+                score -= 2.0
+
+    if has_any(q, ["voice", "voiced", "actor", "played", "portrayed"]):
+        if has_any(prefix, ["character", "portrayed", "film"]):
+            if has_any(r, ["actor", "performer", "performance"]):
+                score += 3.0
+            if has_any(q, ["who"]) and has_any(r, ["character"]):
+                score -= 1.5
+
+    if has_any(q, ["cancer", "disease", "cause", "death", "die", "died"]):
+        if not executed_prefix and has_any(r, ["cause", "death", "disease"]):
+            score += 2.5
+        if has_any(prefix, ["cause", "death"]) and has_any(r, ["cause", "death"]):
+            score -= 2.5
+
     noisy = (
         relation.startswith("base.biblioness.")
         or relation.startswith("base.kwebbase.")
@@ -788,6 +1222,17 @@ def _canonical_relation_token(tok: str) -> str:
         "president": "president",
         "presidential": "president",
         "politicians": "politician",
+        "attended": "attend",
+        "attends": "attend",
+        "schools": "school",
+        "highschools": "highschool",
+        "universities": "university",
+        "institutions": "institution",
+        "teams": "team",
+        "rosters": "roster",
+        "clubs": "club",
+        "athletes": "athlete",
+        "sports": "sport",
         "works": "work",
         "written": "write",
         "wrote": "write",
@@ -797,6 +1242,20 @@ def _canonical_relation_token(tok: str) -> str:
         "invented": "invent",
         "inventions": "invent",
         "innovator": "invent",
+        "nominations": "nomination",
+        "nominated": "nomination",
+        "symbols": "symbol",
+        "relationships": "relationship",
+        "namesake": "named",
+        "portrays": "portrayed",
+        "portray": "portrayed",
+        "performed": "performance",
+        "performances": "performance",
+        "actors": "actor",
+        "performers": "performer",
+        "died": "die",
+        "deceased": "death",
+        "diseases": "disease",
     }
     if tok in aliases:
         return aliases[tok]
@@ -849,6 +1308,167 @@ def _oracle_next_relation(backend: LocalSubgraphBackend, executed_prefix):
     if idx < len(oracle):
         return oracle[idx]
     return None
+
+
+def _dedupe_relation_options(options):
+    """Keep one representative per directed relation during guided rollouts."""
+    out = []
+    seen = set()
+    for entity, relation, head in options:
+        key = (relation, bool(head))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append((entity, relation, bool(head)))
+    return out
+
+
+def _pog_relation_signals(
+    backend,
+    candidate,
+    executed_prefix,
+    remaining_horizon,
+    fanout_penalty=0.15,
+):
+    """PoG-style guidance/memory/reflection signals over legal ToG actions.
+
+    Guidance: question- and prefix-conditioned schema intent.
+    Memory: discourage repeated relations and short relation loops.
+    Reflection: prefer actions that keep the search alive while avoiding noisy
+    high-fanout branches. This uses only local graph structure, not gold answers.
+    """
+    relation = candidate["relation"]
+    next_entities = backend.entity_search(candidate["entity"], relation, bool(candidate["head"]))
+    guidance = _question_conditioned_relation_score(backend.question, relation, executed_prefix)
+
+    memory = 0.0
+    if relation in set(executed_prefix or []):
+        memory -= 1.5
+    rel_tokens = set(_relation_tokens_norm(relation))
+    for prev in executed_prefix or []:
+        overlap = rel_tokens & set(_relation_tokens_norm(prev))
+        if overlap and len(executed_prefix) > 0:
+            memory -= 0.25
+    if len(executed_prefix or []) >= 2 and relation == executed_prefix[-2]:
+        memory -= 1.0
+
+    fanout = len(next_entities)
+    reflection = 0.0
+    if fanout <= 0:
+        reflection -= 3.0
+    elif fanout == 1:
+        reflection += 0.3
+    elif fanout <= 5:
+        reflection += 0.15
+    else:
+        reflection -= float(fanout_penalty) * __import__("math").log1p(fanout)
+
+    # Limited-commitment cue: if the current action is already specific and the
+    # question looks single-hop, avoid drifting into extra broad branches.
+    if executed_prefix and _question_looks_single_hop(backend.question):
+        reflection -= 0.6
+
+    return guidance, memory, reflection
+
+
+def _question_looks_single_hop(question: str) -> bool:
+    q = " " + " ".join(_relation_tokens_norm(question)) + " "
+
+    def has_any(toks):
+        return any(f" {t} " in q for t in toks)
+
+    if has_any(["where", "born", "birth", "spouse", "wife", "husband", "capital", "language", "spoken"]):
+        return True
+    if has_any(["what"]) and has_any(["type", "cause", "death", "profession", "occupation"]):
+        return True
+    return False
+
+
+def _fusion_features(
+    backend,
+    candidates,
+    executed_prefix,
+    horizon,
+    value_scores,
+    question_scores,
+    candidate_diffusion_scores,
+    trajectory_diffusion_scores,
+    prior_scores=None,
+    guided_scores=None,
+    feature_names=None,
+):
+    """Build online fusion features in the same schema saved by the checkpoint."""
+    if feature_names is None:
+        # Backward-compatible schema used by the original 9-dim fusion checkpoint.
+        feature_names = [
+            "base_score",
+            "value_z",
+            "question_z",
+            "candidate_diffusion_z",
+            "trajectory_diffusion_z",
+            "entity_count_log",
+            "candidate_rank_frac",
+            "depth_frac",
+            "has_entities",
+        ]
+    base_scores = _z_norm([float(c.get("score", 0.0)) for c in candidates])
+    value_z = _z_norm(value_scores)
+    question_z = _z_norm(question_scores)
+    candiff_z = _z_norm(candidate_diffusion_scores)
+    trajdiff_z = _z_norm(trajectory_diffusion_scores)
+    prior_z = _z_norm(prior_scores or [0.0 for _ in candidates])
+    guided_z = _z_norm(guided_scores or [0.0 for _ in candidates])
+    order = sorted(range(len(candidates)), key=lambda i: float(candidates[i].get("score", 0.0)), reverse=True)
+    rank_frac = [0.0 for _ in candidates]
+    denom = max(1, len(candidates) - 1)
+    for rank, idx in enumerate(order):
+        rank_frac[idx] = rank / denom
+    depth_frac = len(executed_prefix) / max(1, int(horizon) - 1)
+    feats = []
+    for i, cand in enumerate(candidates):
+        entities = backend.entity_search(cand["entity"], cand["relation"], bool(cand["head"]))
+        feature_map = {
+            "base_score": float(base_scores[i]),
+            "value_z": float(value_z[i]),
+            "question_z": float(question_z[i]),
+            "candidate_diffusion_z": float(candiff_z[i]),
+            "trajectory_diffusion_z": float(trajdiff_z[i]),
+            "prior_z": float(prior_z[i]),
+            "guided_z": float(guided_z[i]),
+            "entity_count_log": __import__("math").log1p(len(entities)),
+            "candidate_rank_frac": float(rank_frac[i]),
+            "depth_frac": float(depth_frac),
+            "has_entities": 1.0 if entities else 0.0,
+        }
+        feats.append([float(feature_map.get(name, 0.0)) for name in feature_names])
+    return feats
+
+
+def _sample_ranked_option(ranked_options, temperature: float, rng_seed: int):
+    """Sample one option from a top-k guided distribution.
+
+    ``temperature<=0`` makes this deterministic top-1. A small positive
+    temperature turns single rollout into a trajectory distribution without
+    leaving ToG's legal action space.
+    """
+    if not ranked_options:
+        raise ValueError("ranked_options must not be empty")
+    if temperature <= 0.0 or len(ranked_options) == 1:
+        return ranked_options[0]
+    rng = random.Random(int(rng_seed))
+    scores = [float(score) for _option, score in ranked_options]
+    max_score = max(scores)
+    weights = [pow(2.718281828459045, (score - max_score) / max(1e-6, temperature)) for score in scores]
+    total = sum(weights)
+    if total <= 0.0:
+        return ranked_options[0]
+    pick = rng.random() * total
+    acc = 0.0
+    for item, weight in zip(ranked_options, weights):
+        acc += weight
+        if acc >= pick:
+            return item
+    return ranked_options[-1]
 
 
 def _relation_jaccard(a: str, b: str) -> float:
@@ -940,6 +1560,34 @@ def relation_first_select(
     return True, chain_of_entities, entities_id, pre_relations, pre_heads
 
 
+def pog_rerank_candidates(backend, candidates, executed_prefix, args):
+    """PoG-only candidate ordering without DiPLaN checkpoints."""
+    if not candidates:
+        return candidates
+    out = []
+    for cand in candidates:
+        cc = dict(cand)
+        guidance, memory, reflection = _pog_relation_signals(
+            backend,
+            cc,
+            executed_prefix,
+            remaining_horizon=max(1, int(args.depth) - len(executed_prefix)),
+            fanout_penalty=float(args.pog_fanout_penalty),
+        )
+        pog_score = (
+            float(args.pog_guidance_weight) * float(guidance)
+            + float(args.pog_memory_weight) * float(memory)
+            + float(args.pog_reflection_weight) * float(reflection)
+        )
+        cc["pog_guidance_score"] = float(guidance)
+        cc["pog_memory_score"] = float(memory)
+        cc["pog_reflection_score"] = float(reflection)
+        cc["pog_score"] = float(pog_score)
+        cc["score"] = float(cc.get("score", 0.0)) + float(pog_score)
+        out.append(cc)
+    return sorted(out, key=lambda x: x["score"], reverse=True)
+
+
 def _mean_or_none(xs):
     vals = [float(x) for x in xs if x is not None]
     return mean(vals) if vals else None
@@ -972,15 +1620,21 @@ def _print_trace(task_no, trace_record, topk):
             )
             if ent.get("rerank"):
                 rr = ent["rerank"]
+                fmt = lambda key, default=0.0: float(rr.get(key, default) or default)
                 print(
                     f"      rerank changed={rr.get('top_changed')} "
-                    f"value_std={rr.get('value_std'):.4f} prior_std={rr.get('prior_std'):.4f} "
-                    f"emb_cov={rr.get('embedding_coverage', 0.0):.2f}",
+                    f"value_std={fmt('value_std'):.4f} prior_std={fmt('prior_std'):.4f} "
+                    f"guided_std={fmt('guided_std'):.4f} "
+                    f"candiff_std={fmt('candidate_diffusion_std'):.4f} "
+                    f"trajdiff_std={fmt('trajectory_diffusion_std'):.4f} "
+                    f"fusion_std={fmt('fusion_std'):.4f} "
+                    f"emb_cov={fmt('embedding_coverage'):.2f}",
                     flush=True,
                 )
                 print(f"      before={rr.get('before_top', [])[:topk]}", flush=True)
                 print(f"      after ={rr.get('after_top', [])[:topk]}", flush=True)
                 print(f"      sampled={rr.get('sampled_paths_top', [])[:2]}", flush=True)
+                print(f"      guided={rr.get('guided_paths_top', [])[:2]}", flush=True)
             else:
                 print(f"      rels={ent.get('kept_after_rerank', [])[:topk]}", flush=True)
         print(
@@ -1012,7 +1666,7 @@ def main():
     parser.add_argument("--opeani_api_keys", type=str, default="EMPTY")
     parser.add_argument("--num_retain_entity", type=int, default=5)
     parser.add_argument("--prune_tools", type=str, default="llm")
-    parser.add_argument("--planning_strategy", type=str, default="tog_diplan", choices=["tog", "tog_diplan"])
+    parser.add_argument("--planning_strategy", type=str, default="tog_diplan", choices=["tog", "tog_diplan", "pog", "pog_diplan"])
     parser.add_argument("--selection_mode", type=str, default="entity_prune", choices=["entity_prune", "relation_first"])
     parser.add_argument("--relation_first_k", type=int, default=0)
     parser.add_argument("--diplan_repo", default="/root/autodl-tmp/DiPLaN")
@@ -1020,19 +1674,53 @@ def main():
     parser.add_argument("--diplan_planner_ckpt", default="")
     parser.add_argument("--diplan_value_ckpt", default="")
     parser.add_argument("--diplan_relation_scorer_ckpt", default="")
+    parser.add_argument("--diplan_candidate_diffusion_ckpt", default="")
+    parser.add_argument("--diplan_trajectory_diffusion_ckpt", default="")
+    parser.add_argument("--diplan_fusion_ckpt", default="")
     parser.add_argument("--diplan_value_weight", type=float, default=1.0)
     parser.add_argument("--diplan_prior_weight", type=float, default=1.0)
     parser.add_argument("--diplan_question_weight", type=float, default=1.0)
+    parser.add_argument("--diplan_schema_prior_weight", type=float, default=0.0)
+    parser.add_argument("--diplan_candidate_diffusion_weight", type=float, default=0.5)
+    parser.add_argument("--diplan_candidate_guidance_scale", type=float, default=1.0)
+    parser.add_argument("--diplan_trajectory_diffusion_weight", type=float, default=0.5)
+    parser.add_argument("--diplan_trajectory_guidance_scale", type=float, default=1.0)
     parser.add_argument(
         "--diplan_score_mode",
         type=str,
         default="fused",
-        choices=["tog_only", "value_only", "question_only", "prior_only", "prior_value", "fused"],
+        choices=[
+            "tog_only",
+            "value_only",
+            "question_only",
+            "candidate_diffusion",
+            "value_candidate_diffusion",
+            "trajectory_diffusion",
+            "value_trajectory_diffusion",
+            "learned_fusion",
+            "value_learned_fusion",
+            "guided",
+            "guided_value",
+            "value_guided",
+            "prior_only",
+            "prior_value",
+            "fused",
+        ],
     )
     parser.add_argument("--diplan_first_step_bonus", type=float, default=1.0)
     parser.add_argument("--diplan_future_step_bonus", type=float, default=0.35)
     parser.add_argument("--diplan_prior_min_jaccard", type=float, default=0.2)
     parser.add_argument("--diplan_horizon", type=int, default=3)
+    parser.add_argument("--diplan_pool_strategy", choices=["lexical", "all_legal"], default="lexical")
+    parser.add_argument("--diplan_guided_rollouts", type=int, default=1)
+    parser.add_argument("--diplan_guided_weight", type=float, default=0.25)
+    parser.add_argument("--diplan_guided_topk", type=int, default=4)
+    parser.add_argument("--diplan_guided_temperature", type=float, default=0.15)
+    parser.add_argument("--diplan_guided_risk_beta", type=float, default=0.3)
+    parser.add_argument("--pog_guidance_weight", type=float, default=0.15)
+    parser.add_argument("--pog_memory_weight", type=float, default=0.4)
+    parser.add_argument("--pog_reflection_weight", type=float, default=0.25)
+    parser.add_argument("--pog_fanout_penalty", type=float, default=0.12)
     parser.add_argument("--diplan_rerank_pool_size", type=int, default=16)
     parser.add_argument("--diplan_post_rerank_topk", type=int, default=0)
     parser.add_argument("--diplan_num_candidates", type=int, default=16)
@@ -1058,7 +1746,7 @@ def main():
     os.environ["TOG_SEED"] = str(args.seed)
 
     rows = _load_jsonl(args.subgraph_jsonl, args.max_tasks)
-    reranker = DiPLaNReranker(args) if args.planning_strategy == "tog_diplan" else None
+    reranker = DiPLaNReranker(args) if _is_diplan_strategy(args) else None
     Path(args.out).mkdir(parents=True, exist_ok=True)
     pred_path = Path(args.out) / "predictions.jsonl"
     trace_path = Path(args.out) / "trace.jsonl"
@@ -1135,6 +1823,18 @@ def main():
                         post_topk = int(args.diplan_post_rerank_topk or args.width)
                         ent_trace["oracle_rank_after_rerank_full"] = _relation_rank(rels, oracle_next)
                         ent_trace["dynamic_rank_after_rerank_full"] = _best_relation_rank(rels, valid_next_relations)
+                        rels = rels[: max(1, post_topk)]
+                    elif _is_pog_strategy(args):
+                        rels = pog_rerank_candidates(backend, rels, executed, args)
+                        post_topk = int(args.diplan_post_rerank_topk or args.width)
+                        ent_trace["oracle_rank_after_rerank_full"] = _relation_rank(rels, oracle_next)
+                        ent_trace["dynamic_rank_after_rerank_full"] = _best_relation_rank(rels, valid_next_relations)
+                        ent_trace["rerank"] = {
+                            "planner": "pog",
+                            "before_top": ent_trace["relations_before_rerank"],
+                            "after_top": _compact_relation_list(rels, topk=8),
+                            "top_changed": bool(rels and ent_trace["relations_before_rerank"] and rels[0].get("relation") != ent_trace["relations_before_rerank"][0].get("relation")),
+                        }
                         rels = rels[: max(1, post_topk)]
                     else:
                         ent_trace["oracle_rank_after_rerank_full"] = ent_trace["oracle_rank_before_rerank"]
@@ -1218,15 +1918,21 @@ def main():
 
                 total_candidates, total_scores, total_relations = [], [], []
                 total_entities_id, total_topic_entities, total_head = [], [], []
+                answer_vote_entities_id, answer_vote_scores = [], []
                 for ent in current_entity_relations_list:
                     entity_candidates_id = backend.entity_search(ent["entity"], ent["relation"], bool(ent["head"]))
                     if len(entity_candidates_id) >= 20:
-                        entity_candidates_id = random.sample(entity_candidates_id, args.num_retain_entity)
+                        entity_candidates_id = random.sample(
+                            entity_candidates_id,
+                            min(args.num_retain_entity, len(entity_candidates_id)),
+                        )
                     if not entity_candidates_id:
                         continue
                     scores, entity_candidates, entity_candidates_id = entity_score_local(
                         backend, question, entity_candidates_id, ent["score"], ent["relation"], args
                     )
+                    answer_vote_entities_id.extend(entity_candidates_id)
+                    answer_vote_scores.extend(scores)
                     total_candidates, total_scores, total_relations, total_entities_id, total_topic_entities, total_head = update_history(
                         entity_candidates, ent, scores, entity_candidates_id,
                         total_candidates, total_scores, total_relations,
@@ -1266,7 +1972,21 @@ def main():
                 if pre_relations:
                     executed.append(pre_relations[0])
                 cluster_chain_of_entities.append(chain_of_entities)
-                success = answer_reached(backend, entities_id)
+                top1_success = answer_reached(backend, entities_id)
+                answer_vote_entities = []
+                answer_vote_success = False
+                if _env_enabled("DIPLAN_ANSWER_VOTING"):
+                    answer_vote_entities = _score_voted_entities(
+                        answer_vote_entities_id,
+                        answer_vote_scores,
+                        _env_int("DIPLAN_ANSWER_VOTE_K", int(args.relation_first_k or args.num_retain_entity)),
+                    )
+                    answer_vote_success = answer_reached(backend, answer_vote_entities)
+                success = bool(top1_success or answer_vote_success)
+                step_trace["answer_reached_top1"] = bool(top1_success)
+                step_trace["answer_voting_enabled"] = bool(_env_enabled("DIPLAN_ANSWER_VOTING"))
+                step_trace["answer_vote_entities"] = list(answer_vote_entities)
+                step_trace["answer_vote_success"] = bool(answer_vote_success)
                 step_trace["answer_reached"] = bool(success)
                 step_trace["continue_flag"] = bool(flag)
                 trace_steps.append(step_trace)
@@ -1299,8 +2019,14 @@ def main():
         "trap@1": mean([1.0 if r["trap_at_1"] else 0.0 for r in records]) if records else 0.0,
         "first_error_step": mean([r["first_error_step"] for r in records]) if records else 0.0,
         "seed": args.seed,
+        "planning_strategy": args.planning_strategy,
         "selection_mode": args.selection_mode,
         "relation_first_k": int(args.relation_first_k or args.num_retain_entity),
+        "diplan_pool_strategy": getattr(args, "diplan_pool_strategy", "lexical"),
+        "pog_guidance_weight": getattr(args, "pog_guidance_weight", 0.0),
+        "pog_memory_weight": getattr(args, "pog_memory_weight", 0.0),
+        "pog_reflection_weight": getattr(args, "pog_reflection_weight", 0.0),
+        "pog_fanout_penalty": getattr(args, "pog_fanout_penalty", 0.0),
         "oracle_rank_before_mean": _mean_or_none(oracle_rank_before_all),
         "oracle_rank_after_mean": _mean_or_none(oracle_rank_after_all),
         "oracle_rank_keep_mean": _mean_or_none(oracle_rank_keep_all),

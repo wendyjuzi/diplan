@@ -132,8 +132,18 @@ def main() -> None:
     ap.add_argument("--out_root", default="data/rog_processed")
     ap.add_argument("--max_tasks", type=int, default=0, help="0 = all rows")
     ap.add_argument("--max_budget", type=int, default=EXTRACT_BUDGET)
+    ap.add_argument(
+        "--dev_fraction",
+        type=float,
+        default=0.0,
+        help="Deterministically hold out this fraction of a processed train split as dev.",
+    )
+    ap.add_argument("--dev_name", default="dev")
     ap.add_argument("--seed", type=int, default=42)
     args = ap.parse_args()
+
+    if not 0.0 <= args.dev_fraction < 1.0:
+        ap.error("--dev_fraction must be in [0, 1)")
 
     ensure_dir(args.out_root)
     rng = random.Random(args.seed)
@@ -145,6 +155,25 @@ def main() -> None:
                 continue
             rows = stream_rows(in_path, args.max_tasks)
             out, stats = process_split(rows, ds, rng, args.max_budget)
+            if split == "train" and args.dev_fraction > 0.0:
+                if len(out) < 2:
+                    raise ValueError("Need at least two aligned train rows to create a dev split")
+                order = list(range(len(out)))
+                random.Random(args.seed + 1009).shuffle(order)
+                n_dev = max(1, round(len(out) * args.dev_fraction))
+                n_dev = min(n_dev, len(out) - 1)
+                dev_indices = set(order[:n_dev])
+                train_out = [row for i, row in enumerate(out) if i not in dev_indices]
+                dev_out = [row for i, row in enumerate(out) if i in dev_indices]
+                train_path = Path(args.out_root) / f"{ds}_train.jsonl"
+                dev_path = Path(args.out_root) / f"{ds}_{args.dev_name}.jsonl"
+                write_jsonl(str(train_path), train_out)
+                write_jsonl(str(dev_path), dev_out)
+                print(
+                    f"[ok] {train_path} n={len(train_out)}; "
+                    f"{dev_path} n={len(dev_out)}; source_stats={stats}"
+                )
+                continue
             out_path = Path(args.out_root) / f"{ds}_{split}.jsonl"
             write_jsonl(str(out_path), out)
             print(f"[ok] {out_path}  {stats}")

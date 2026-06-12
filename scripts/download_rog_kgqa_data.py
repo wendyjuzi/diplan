@@ -7,6 +7,7 @@ evaluation reproducible without relying on an interactive notebook.
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Dict
@@ -40,12 +41,36 @@ def main() -> None:
         help="Splits to export. Use 'all' to export every split returned by HuggingFace.",
     )
     parser.add_argument("--out_root", type=str, default="data/rog")
+    parser.add_argument(
+        "--cache_dir",
+        type=str,
+        default=None,
+        help="Optional HuggingFace datasets cache directory.",
+    )
+    parser.add_argument(
+        "--offline",
+        action="store_true",
+        help="Load only from the local HuggingFace cache.",
+    )
+    parser.add_argument(
+        "--continue_on_error",
+        action="store_true",
+        help="Skip a dataset/split that cannot be loaded instead of aborting the whole export.",
+    )
     args = parser.parse_args()
 
     try:
-        from datasets import load_dataset
+        from datasets import DownloadConfig, load_dataset
     except ImportError as exc:
         raise SystemExit("Please install HuggingFace datasets first: pip install -U datasets pyarrow") from exc
+
+    if args.offline:
+        os.environ.setdefault("HF_DATASETS_OFFLINE", "1")
+        os.environ.setdefault("HF_HUB_OFFLINE", "1")
+    download_config = DownloadConfig(
+        cache_dir=args.cache_dir,
+        local_files_only=args.offline,
+    )
 
     out_root = Path(args.out_root)
     ensure_dir(str(out_root))
@@ -56,10 +81,33 @@ def main() -> None:
         out_dir = out_root / name
         ensure_dir(str(out_dir))
         split_counts = {}
-        if len(args.splits) == 1 and args.splits[0].lower() == "all":
-            split_map = load_dataset(hf_name)
-        else:
-            split_map = {split: load_dataset(hf_name, split=split) for split in args.splits}
+        try:
+            if len(args.splits) == 1 and args.splits[0].lower() == "all":
+                split_map = load_dataset(
+                    hf_name,
+                    cache_dir=args.cache_dir,
+                    download_config=download_config,
+                )
+            else:
+                split_map = {}
+                for split in args.splits:
+                    try:
+                        split_map[split] = load_dataset(
+                            hf_name,
+                            split=split,
+                            cache_dir=args.cache_dir,
+                            download_config=download_config,
+                        )
+                    except Exception as exc:
+                        if not args.continue_on_error:
+                            raise
+                        print(f"[warn] skip {hf_name} split={split}: {type(exc).__name__}: {exc}")
+        except Exception as exc:
+            if not args.continue_on_error:
+                raise
+            print(f"[warn] skip dataset {hf_name}: {type(exc).__name__}: {exc}")
+            manifest[name] = {"hf_dataset": hf_name, "error": repr(exc), "splits": split_counts}
+            continue
         for split, split_ds in split_map.items():
             out_path = out_dir / f"{split}.jsonl"
             with out_path.open("w", encoding="utf-8") as f:

@@ -91,6 +91,16 @@ training split; never train it on WebQSP/CWQ test questions.
 Train:
 
 ```bash
+python scripts/download_rog_kgqa_data.py \
+  --datasets webqsp \
+  --splits train
+
+python scripts/prepare_rog_kg_env_data.py \
+  --datasets webqsp \
+  --splits train \
+  --dev_fraction 0.1 \
+  --seed 42
+
 python train_relation_scorer_torch.py \
   --train_path data/rog_processed/webqsp_train.jsonl \
   --valid_path data/rog_processed/webqsp_dev.jsonl \
@@ -110,10 +120,125 @@ Recommended ablations:
 ```text
 tog_only       ToG proposal score
 question_only  learned question-relation retrieval
+guided        candidate-conditioned question-guided rollout
+guided_value  guided rollout plus trajectory value scoring
+candidate_diffusion learned candidate-set denoising planner
+value_candidate_diffusion value plus candidate denoising planner
+trajectory_diffusion relation-sequence denoising planner
+value_trajectory_diffusion value plus trajectory denoising planner
+learned_fusion learned entity-aware fusion head
+value_learned_fusion value plus learned fusion head
 prior_only     question prior + AE trajectory prior
 value_only     trajectory value only
 prior_value    question/AE prior + trajectory value
 fused          ToG + question/AE prior + trajectory value
+```
+
+`guided` and `guided_value` are the lightweight diffusion-planning variants. They
+treat ToG's legal first relation as an inpainted trajectory prefix, roll out a
+short future path under the learned question-relation prior, and score the whole
+trajectory. This follows the planning mechanisms of Diffuser-style trajectory
+inpainting/guidance while respecting KGQA's discrete legal action set.
+
+Paper-facing guided-planning ablations:
+
+```text
+rollouts: 1, 2, 4, 8
+risk beta: 0.0, 0.3, 0.7
+horizon: fixed H=3 first; adaptive horizon is a later ablation
+```
+
+For each candidate first relation, the runner now samples a small distribution
+of state-action trajectories `(entity, relation, next_entities)` and aggregates
+trajectory values with risk-aware guidance:
+
+```text
+guided_score = mean(V(trajectory)) - beta * std(V(trajectory)) + question_prior
+```
+
+Candidate-conditioned discrete diffusion:
+
+```bash
+python train_candidate_diffusion_planner.py \
+  --train_path data/rog_processed/webqsp_train.jsonl \
+  --valid_path data/rog_processed/webqsp_dev.jsonl \
+  --out runs/candidate_diffusion_webqsp_seed42 \
+  --epochs 20 \
+  --batch_size 64 \
+  --condition_dropout 0.1 \
+  --noise_strategy hard \
+  --seed 42
+
+python scripts/analyze_candidate_diffusion_recall.py \
+  --path data/rog_processed/webqsp_dev.jsonl \
+  --ckpt runs/candidate_diffusion_webqsp_seed42/best.pt \
+  --out results/candidate_diffusion_webqsp_seed42_dev \
+  --guidance_scale 1.0
+```
+
+Classifier-free guidance sweep:
+
+```bash
+for S in 0.5 1.0 1.5 2.0; do
+  python scripts/analyze_candidate_diffusion_recall.py \
+    --path data/rog_processed/webqsp_dev.jsonl \
+    --ckpt runs/candidate_diffusion_webqsp_seed42/best.pt \
+    --out results/candidate_diffusion_webqsp_seed42_dev_cfg${S} \
+    --guidance_scale $S
+done
+```
+
+Pass the checkpoint to the official-ToG adapted runner:
+
+```bash
+--diplan_candidate_diffusion_ckpt \
+  /root/autodl-tmp/DiPLaN/runs/candidate_diffusion_webqsp_seed42/best.pt
+--diplan_candidate_guidance_scale 1.5
+```
+
+Learned fusion head:
+
+Trajectory-level discrete diffusion:
+
+```bash
+python train_trajectory_diffusion_planner.py \
+  --train_path data/rog_processed/webqsp_train.jsonl \
+  --valid_path data/rog_processed/webqsp_dev.jsonl \
+  --out runs/trajectory_diffusion_webqsp_seed42 \
+  --horizon 3 \
+  --condition_dropout 0.1 \
+  --epochs 20 \
+  --seed 42
+
+python scripts/analyze_trajectory_diffusion_recall.py \
+  --path data/rog_processed/webqsp_dev.jsonl \
+  --ckpt runs/trajectory_diffusion_webqsp_seed42/best.pt \
+  --out results/trajectory_diffusion_webqsp_seed42_dev \
+  --guidance_scale 1.0
+```
+
+```bash
+python train_fusion_ranker.py \
+  --train_path data/rog_processed/webqsp_train.jsonl \
+  --valid_path data/rog_processed/webqsp_dev.jsonl \
+  --out runs/fusion_ranker_webqsp_seed42 \
+  --relation_scorer_ckpt runs/relation_scorer_webqsp_seed42/best.pt \
+  --candidate_diffusion_ckpt runs/candidate_diffusion_webqsp_seed42_hardcfg/best.pt \
+  --candidate_guidance_scale 1.0 \
+  --trajectory_diffusion_ckpt runs/trajectory_diffusion_webqsp_seed42/best.pt \
+  --trajectory_guidance_scale 1.0 \
+  --ae_ckpt runs/ae_kgqa_torch_real_tune3_noise003/best.pt \
+  --planner_ckpt runs/multiseed_cross_infonce_cwq_webqsp/seed_42/mlp_planner/best.pt \
+  --value_ckpt runs/final_kgqa_pool48_strong_multiseed/seed_42/value_full_pool_listwise/best.pt \
+  --epochs 20 \
+  --seed 42
+```
+
+Runner flags:
+
+```bash
+--diplan_fusion_ckpt /root/autodl-tmp/DiPLaN/runs/fusion_ranker_webqsp_seed42/best.pt
+--diplan_score_mode learned_fusion
 ```
 
 Report the full decision funnel in addition to Hits@1:
@@ -153,3 +278,11 @@ Literature basis:
   https://arxiv.org/abs/2305.02118
 - Why Reasoning Fails to Plan / FLARE: future-aware evaluation and limited
   commitment, https://arxiv.org/abs/2601.22311
+- Diffuser: trajectory denoising, planning as sampling, and inpainting/guidance,
+  https://arxiv.org/abs/2205.09991
+- Decision Diffuser: return/constraint/skill-conditioned trajectory generation,
+  https://arxiv.org/abs/2211.15657
+- D3PM: discrete diffusion with structured transition matrices over token states,
+  https://arxiv.org/abs/2107.03006
+- Diffusion-QL: value-regularized diffusion policies for offline decision making,
+  https://arxiv.org/abs/2208.06193
