@@ -31,6 +31,7 @@ Example:
 
 import argparse
 import os
+import math
 import random
 import sys
 import time
@@ -480,6 +481,107 @@ def _projection_features(plan, prefix_pos, admissible, constraints, executed_pre
     }
 
 
+def _anchor_plan_from_command(cmd: str, executed_prefix: List[str], max_path_len: int) -> List[str]:
+    """Convert a currently admissible command into a short executable anchor plan.
+
+    This makes plan-to-action grounding part of the candidate plan pool instead
+    of only a late fallback. The anchor still goes through the same value,
+    constraint, and projection reranking as sampled diffusion plans.
+    """
+    plan = list(executed_prefix) + [normalize_action(cmd)]
+    return plan[: max(1, int(max_path_len))]
+
+
+def _token_compatibility_with_action(plan_token: str, cmd: str) -> float:
+    """Soft alignment between a decoded future token and a concrete command.
+
+    This is deliberately type-level (verb/object/receptacle), matching the
+    instance-free ALFWorld plan vocabulary. It lets executable anchors join the
+    plan pool only when the diffusion samples already point toward the same
+    future subgoal, instead of letting every admissible action become a plan.
+    """
+    want = parse_action_token(plan_token)
+    got = parse_action(cmd)
+    if want.get("verb") == "OTHER" or got.get("verb") == "OTHER":
+        return 0.0
+    score = 0.0
+    if want.get("verb") == got.get("verb"):
+        score += 1.0
+    else:
+        return 0.0
+    if want.get("obj") and got.get("obj") == want.get("obj"):
+        score += 1.0
+    if want.get("recep") and got.get("recep") == want.get("recep"):
+        score += 1.0
+    return score / 3.0
+
+
+def _diffusion_action_support(cmd: str, sampled_plans, executed_prefix, args) -> float:
+    """How strongly sampled diffusion plans support executing ``cmd`` now."""
+    prefix_pos = len(executed_prefix)
+    lookahead = max(1, int(getattr(args, "anchor_support_lookahead", getattr(args, "plan_lookahead", 6))))
+    best = 0.0
+    total = 0.0
+    hits = 0
+    for plan in sampled_plans:
+        start = prefix_pos if list(plan[:prefix_pos]) == list(executed_prefix) else 0
+        end = min(len(plan), start + lookahead)
+        local = 0.0
+        for offset, pos in enumerate(range(start, end)):
+            compat = _token_compatibility_with_action(plan[pos], cmd)
+            if compat <= 0.0:
+                continue
+            local = max(local, compat / float(1 + offset))
+        if local > 0.0:
+            hits += 1
+            total += local
+            best = max(best, local)
+    if hits <= 0:
+        return 0.0
+    # Combine "at least one strong future hint" and "many plans agree".
+    coverage = hits / max(1, len(sampled_plans))
+    mean = total / max(1, hits)
+    return float(best + 0.5 * mean + 0.5 * coverage)
+
+
+def _projection_anchor_plans(admissible, executed_prefix, constraints, memory, spec, concrete_counts, args, max_path_len, sampled_plans=None):
+    anchors = []
+    seen = set()
+    pool = _filter_failed_admissible(list(admissible), memory)
+    sampled_plans = list(sampled_plans or [])
+    scored = []
+    for cmd in pool:
+        if not _is_useful_projected_action(cmd, spec):
+            continue
+        token = normalize_action(cmd)
+        feasible, _ = is_feasible(list(executed_prefix) + [token], constraints)
+        if not feasible:
+            continue
+        support = _diffusion_action_support(cmd, sampled_plans, executed_prefix, args)
+        min_support = float(getattr(args, "anchor_min_diffusion_support", 0.0))
+        if bool(getattr(args, "anchor_requires_diffusion_support", True)) and support < min_support:
+            continue
+        score = _action_constraint_penalty(cmd, memory, spec)
+        score -= float(args.revisit_penalty) * concrete_counts.get(cmd, 0)
+        score += float(getattr(args, "anchor_diffusion_support_weight", 6.0)) * support
+        # Prefer concrete commands that exactly realize the abstract anchor token.
+        projected, match = _project_head_instance_aware(token, pool, None, concrete_counts)
+        if projected is not None:
+            score += 10.0 * float(match)
+        scored.append((score, cmd))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    limit = int(getattr(args, "projection_anchor_topk", 0))
+    if limit <= 0:
+        limit = len(scored)
+    for _score, cmd in scored[:limit]:
+        plan = _anchor_plan_from_command(cmd, executed_prefix, max_path_len)
+        key = tuple(plan)
+        if key and key not in seen:
+            seen.add(key)
+            anchors.append(plan)
+    return anchors
+
+
 @torch.no_grad()
 def _plan_and_select(M, query_tokens, executed_prefix, admissible, args, constraints, memory, spec, concrete_counts):
     """Generate candidate plans, rerank, and project the head onto an admissible command.
@@ -496,9 +598,31 @@ def _plan_and_select(M, query_tokens, executed_prefix, admissible, args, constra
         prediction_target=M["prediction_target"], planner_type=M["planner_type"],
         jitter_std=float(args.candidate_jitter_std),
     )
-    # Dedupe candidate plans.
+    # Dedupe candidate plans. Optionally inject executable anchors derived from
+    # current admissible commands so grounding participates in plan reranking
+    # instead of only rescuing failures as a late fallback.
     uniq = []
     seen = set()
+    anchor_keys = set()
+    if bool(getattr(args, "projection_anchor_actions", True)):
+        anchors = _projection_anchor_plans(
+            admissible,
+            executed_prefix,
+            constraints,
+            memory,
+            spec,
+            concrete_counts,
+            args,
+            M["max_path_len"],
+            sampled_plans=cands,
+        )
+        for c in anchors:
+            key = tuple(c)
+            if key:
+                anchor_keys.add(key)
+                if key not in seen:
+                    seen.add(key)
+                    uniq.append(c)
     for c in cands:
         key = tuple(c)
         if key and key not in seen:
@@ -553,6 +677,11 @@ def _plan_and_select(M, query_tokens, executed_prefix, admissible, args, constra
     prefer_recep = memory["object_locations"].get(obj) if obj else None
 
     # Two passes: prefer plans that extend the executed prefix, then any plan.
+    # In aggregate mode, the executable action is decoded from a distribution of
+    # future plans rather than from a single highest-scoring plan. This is the
+    # main plan-executor alignment path: diffusion proposes future trajectories,
+    # projection maps them to legal commands, and consensus/value select the
+    # current action. Grounded fallback remains only a safety net.
     projected = []
     used_signatures = Counter()
     for require_prefix in (True, False):
@@ -570,11 +699,56 @@ def _plan_and_select(M, query_tokens, executed_prefix, admissible, args, constra
                 sig = _action_signature(cmd)
                 diversity = 0.0 if used_signatures[sig] else float(args.coverage_diversity_bonus)
                 total = float(scores[i]) + proj_score + diversity
-                projected.append((total, i, cmd, head_token, plan, sig, proj_score))
+                is_anchor = tuple(plan) in anchor_keys
+                support = _diffusion_action_support(cmd, cands, executed_prefix, args)
+                projected.append((total, i, cmd, head_token, plan, sig, proj_score, is_anchor, support))
                 used_signatures[sig] += 1
         if projected:
-            projected.sort(key=lambda x: x[0], reverse=True)
-            _, selected_i, cmd, head_token, plan, _sig, selected_exec_proj = projected[0]
+            mode = str(getattr(args, "execution_alignment_mode", "aggregate")).lower()
+            if mode == "aggregate":
+                grouped: Dict[str, Dict[str, Any]] = {}
+                for item in projected:
+                    total, i, cmd0, head0, plan0, sig0, proj0, is_anchor0, support0 = item
+                    adjusted = float(total)
+                    adjusted += float(getattr(args, "action_diffusion_support_weight", 2.0)) * float(support0)
+                    if is_anchor0:
+                        adjusted -= float(getattr(args, "anchor_selection_penalty", 3.0))
+                    g = grouped.setdefault(
+                        cmd0,
+                        {
+                            "score": float("-inf"),
+                            "count": 0,
+                            "non_anchor_count": 0,
+                            "best": item,
+                            "support": 0.0,
+                        },
+                    )
+                    g["count"] += 1
+                    g["non_anchor_count"] += 0 if is_anchor0 else 1
+                    g["support"] = max(float(g["support"]), float(support0))
+                    if adjusted > float(g["score"]):
+                        g["score"] = adjusted
+                        g["best"] = item
+
+                consensus_weight = float(getattr(args, "action_consensus_weight", 1.0))
+                non_anchor_weight = float(getattr(args, "non_anchor_consensus_weight", 1.5))
+                for g in grouped.values():
+                    g["score"] = float(g["score"])
+                    g["score"] += consensus_weight * math.log1p(int(g["count"]))
+                    g["score"] += non_anchor_weight * math.log1p(int(g["non_anchor_count"]))
+
+                best_group = max(grouped.values(), key=lambda g: float(g["score"]))
+                _, selected_i, cmd, head_token, plan, _sig, selected_exec_proj, selected_is_anchor, selected_support = best_group["best"]
+                selected_action_evidence = int(best_group["count"])
+                selected_non_anchor_evidence = int(best_group["non_anchor_count"])
+                selected_group_score = float(best_group["score"])
+            else:
+                projected.sort(key=lambda x: x[0], reverse=True)
+                _, selected_i, cmd, head_token, plan, _sig, selected_exec_proj, selected_is_anchor, selected_support = projected[0]
+                selected_action_evidence = 1
+                selected_non_anchor_evidence = 0 if selected_is_anchor else 1
+                selected_group_score = float(projected[0][0])
+
             value_order = sorted(range(len(uniq)), key=lambda j: raw_value_scores[j], reverse=True)
             proj_order = sorted(range(len(uniq)), key=lambda j: proj_scores[j], reverse=True)
             diag = {
@@ -587,6 +761,12 @@ def _plan_and_select(M, query_tokens, executed_prefix, admissible, args, constra
                 "projection_gate_size": int(len(selectable)),
                 "selected_value_rank": int(value_order.index(selected_i) + 1) if selected_i in value_order else 0,
                 "selected_projection_rank": int(proj_order.index(selected_i) + 1) if selected_i in proj_order else 0,
+                "anchor_candidate_rate": len(anchor_keys) / max(1, len(uniq)),
+                "selected_anchor": float(selected_is_anchor),
+                "selected_diffusion_support": float(selected_support),
+                "selected_action_evidence": float(selected_action_evidence),
+                "selected_non_anchor_evidence": float(selected_non_anchor_evidence),
+                "selected_group_score": float(selected_group_score),
             }
             return cmd, head_token, plan, len(uniq), diag
     # Head not projectable from any plan; signal fallback to the caller.
@@ -602,6 +782,8 @@ def _plan_and_select(M, query_tokens, executed_prefix, admissible, args, constra
         "projection_gate_size": int(len(selectable)),
         "selected_value_rank": 0,
         "selected_projection_rank": 0,
+        "anchor_candidate_rate": len(anchor_keys) / max(1, len(uniq)),
+        "selected_anchor": 0.0,
     }
     return None, best_head, best_plan, len(uniq), diag
 
@@ -671,13 +853,30 @@ def _hard_goal_action(admissible, memory: Dict[str, Any], spec: Dict[str, Any], 
     if has_obj and recep:
         if transform in TRANSFORM_TOOLS and transform not in memory.get("completed_transforms", set()):
             transform_verb = TRANSFORM_STAGE[transform]
+            failed = _failed_signatures(memory)
             transforms = [
                 cmd for cmd, p in parsed
-                if p.get("verb") == transform_verb and obj in _normalize_entity(p.get("obj", ""))
+                if p.get("verb") == transform_verb
+                and obj in _normalize_entity(p.get("obj", ""))
+                and cmd.lower() not in failed
+                and _action_signature(cmd) not in failed
             ]
             if transforms:
                 transforms.sort(key=lambda c: concrete_counts.get(c, 0))
                 return transforms[0]
+            # The transform verb itself already failed (or was never admissible):
+            # re-target the tool receptacle before retrying, instead of falling
+            # through to the generic fallback and losing this subgoal's shortcut.
+            tool_opens = [
+                cmd for cmd, p in parsed
+                if p.get("verb") == "OPEN"
+                and _normalize_entity(p.get("recep", "")) in TRANSFORM_TOOLS[transform]
+                and cmd.lower() not in failed
+                and _action_signature(cmd) not in failed
+            ]
+            if tool_opens:
+                tool_opens.sort(key=lambda c: concrete_counts.get(c, 0))
+                return tool_opens[0]
             tool_gotos = [
                 cmd for cmd, p in parsed
                 if p.get("verb") == "GOTO"
@@ -686,14 +885,6 @@ def _hard_goal_action(admissible, memory: Dict[str, Any], spec: Dict[str, Any], 
             if tool_gotos:
                 tool_gotos.sort(key=lambda c: concrete_counts.get(c, 0))
                 return tool_gotos[0]
-            tool_opens = [
-                cmd for cmd, p in parsed
-                if p.get("verb") == "OPEN"
-                and _normalize_entity(p.get("recep", "")) in TRANSFORM_TOOLS[transform]
-            ]
-            if tool_opens:
-                tool_opens.sort(key=lambda c: concrete_counts.get(c, 0))
-                return tool_opens[0]
 
         puts = [
             cmd for cmd, p in parsed
@@ -867,6 +1058,13 @@ def _run_episode(env, M, episode_id, args) -> Dict[str, Any]:
                     memory=memory,
                     head_token=head_token,
                 )
+            elif bool(getattr(args, "strict_projection", False)):
+                # Strict ablation: do not rescue unprojectable plans with the
+                # value-ranked admissible-action fallback. This exposes the
+                # usefulness of projected plans themselves.
+                safe = [a for a in admissible if str(a).lower() not in UTILITY_COMMANDS]
+                cmd = safe[0] if safe else admissible[0]
+                head_token = head_token or normalize_action(cmd)
             else:
                 # Graceful degradation: value-rank admissible commands directly.
                 cmd, head_token = _value_rank_admissible(
@@ -885,7 +1083,8 @@ def _run_episode(env, M, episode_id, args) -> Dict[str, Any]:
         obs, scores, dones, infos = env.step([cmd])
         obs_text = _text(obs)
         if any(cmd.lower().startswith(p) for p in ("heat ", "cool ", "clean ")):
-            memory["completed_transforms"].add(spec.get("transform", ""))
+            if "nothing happens" not in obs_text.lower():
+                memory["completed_transforms"].add(spec.get("transform", ""))
         _update_memory(memory, obs_text, cmd, infos.get("admissible_commands", [[]])[0])
         executed_prefix.append(executed_token)
         observations.append(obs_text)
@@ -903,7 +1102,8 @@ def _run_episode(env, M, episode_id, args) -> Dict[str, Any]:
     repeated_failure = any(str(a).lower() in failed or _action_signature(a) in failed for a in raw_actions)
     constraint_violation = bool((not exec_feasible) or repeated_failure)
     consistency = consistency_hits / max(1, steps)
-    first_error = _first_error_step(raw_actions, success)
+    failure_steps = [idx for idx, obs in enumerate(observations[1:], start=1) if _has_failure_feedback(obs)]
+    first_error = failure_steps[0] if failure_steps else (steps + 1 if success else _first_error_step(raw_actions, success))
     def _diag_mean(key: str) -> float:
         vals = [float(d.get(key, 0.0)) for d in projection_diags if d]
         return sum(vals) / len(vals) if vals else 0.0
@@ -917,7 +1117,7 @@ def _run_episode(env, M, episode_id, args) -> Dict[str, Any]:
         "final_score": score,
         "num_steps": steps,
         "first_error_step": first_error,
-        "recovery_at_error": bool(success and first_error <= steps),
+        "recovery_at_error": bool(success and failure_steps and first_error < steps),
         "trap_at_1": bool(raw_actions and _is_trap_first_action(raw_actions[0], spec.get("terms", []))),
         "plan_feasibility": plan_feasibility,
         "constraint_violation": constraint_violation,
@@ -933,6 +1133,12 @@ def _run_episode(env, M, episode_id, args) -> Dict[str, Any]:
         "projection_gate_size": _diag_mean("projection_gate_size"),
         "selected_rank_by_value": _diag_mean("selected_value_rank"),
         "selected_rank_by_projection": _diag_mean("selected_projection_rank"),
+        "anchor_candidate_rate": _diag_mean("anchor_candidate_rate"),
+        "selected_anchor_rate": _diag_mean("selected_anchor"),
+        "selected_diffusion_support": _diag_mean("selected_diffusion_support"),
+        "selected_action_evidence": _diag_mean("selected_action_evidence"),
+        "selected_non_anchor_evidence": _diag_mean("selected_non_anchor_evidence"),
+        "selected_group_score": _diag_mean("selected_group_score"),
         "grounded_fallbacks": grounded_fallbacks,
         "grounded_fallback_rate": grounded_fallbacks / max(1, steps),
         "executed_plan_tokens": executed_prefix,
@@ -970,6 +1176,12 @@ def _summarize(rows: List[Dict[str, Any]]) -> Dict[str, Dict[str, float]]:
         "projection_gate_size": sum(float(r.get("projection_gate_size", 0.0)) for r in rows) / n,
         "selected_rank_by_value": sum(float(r.get("selected_rank_by_value", 0.0)) for r in rows) / n,
         "selected_rank_by_projection": sum(float(r.get("selected_rank_by_projection", 0.0)) for r in rows) / n,
+        "anchor_candidate_rate": sum(float(r.get("anchor_candidate_rate", 0.0)) for r in rows) / n,
+        "selected_anchor_rate": sum(float(r.get("selected_anchor_rate", 0.0)) for r in rows) / n,
+        "selected_diffusion_support": sum(float(r.get("selected_diffusion_support", 0.0)) for r in rows) / n,
+        "selected_action_evidence": sum(float(r.get("selected_action_evidence", 0.0)) for r in rows) / n,
+        "selected_non_anchor_evidence": sum(float(r.get("selected_non_anchor_evidence", 0.0)) for r in rows) / n,
+        "selected_group_score": sum(float(r.get("selected_group_score", 0.0)) for r in rows) / n,
         "grounded_fallback_rate": sum(float(r.get("grounded_fallback_rate", 0.0)) for r in rows) / n,
         "avg_steps": sum(float(r["num_steps"]) for r in rows) / n,
     }
@@ -1011,12 +1223,84 @@ def main() -> None:
         help="Hard executable-planning gate: discard candidates below this projection score when possible.",
     )
     parser.add_argument(
+        "--projection_anchor_actions",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Inject current admissible commands as short executable anchor plans before value/projection reranking.",
+    )
+    parser.add_argument(
+        "--projection_anchor_topk",
+        type=int,
+        default=4,
+        help="Maximum executable anchor plans injected per decision step (<=0 keeps all useful admissible anchors).",
+    )
+    parser.add_argument(
+        "--anchor_requires_diffusion_support",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Only inject executable anchors that are supported by sampled diffusion future plans.",
+    )
+    parser.add_argument(
+        "--anchor_min_diffusion_support",
+        type=float,
+        default=0.35,
+        help="Minimum diffusion-plan support required before an admissible command may become an anchor plan.",
+    )
+    parser.add_argument(
+        "--anchor_support_lookahead",
+        type=int,
+        default=6,
+        help="Number of future decoded tokens scanned when measuring diffusion support for an executable anchor.",
+    )
+    parser.add_argument(
+        "--anchor_diffusion_support_weight",
+        type=float,
+        default=6.0,
+        help="Reranking bonus for executable anchors that agree with sampled diffusion future plans.",
+    )
+    parser.add_argument(
+        "--execution_alignment_mode",
+        choices=["aggregate", "best_plan"],
+        default="aggregate",
+        help="Decode actions by aggregating projected diffusion-plan evidence, or by taking the best single plan.",
+    )
+    parser.add_argument(
+        "--action_diffusion_support_weight",
+        type=float,
+        default=2.0,
+        help="Selection bonus for actions whose projection is supported by sampled diffusion plans.",
+    )
+    parser.add_argument(
+        "--action_consensus_weight",
+        type=float,
+        default=1.0,
+        help="Aggregate decoder bonus when multiple candidate plans project to the same concrete action.",
+    )
+    parser.add_argument(
+        "--non_anchor_consensus_weight",
+        type=float,
+        default=1.5,
+        help="Extra aggregate bonus when non-anchor diffusion samples independently support the selected action.",
+    )
+    parser.add_argument(
+        "--anchor_selection_penalty",
+        type=float,
+        default=3.0,
+        help="Penalty applied only at selection time so anchors assist grounding without dominating diffusion plans.",
+    )
+    parser.add_argument(
         "--state_conditioning",
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Condition the diffusion/value models on symbolic environment memory as well as the goal.",
     )
     parser.add_argument("--grounded_fallback", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--strict_projection",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Ablation: when no plan projects, do not use the value-ranked admissible-action fallback.",
+    )
     parser.add_argument("--plan_lookahead", type=int, default=6)
     parser.add_argument("--plan_lookahead_pos_bonus", type=float, default=4.0)
     parser.add_argument("--coverage_diversity_bonus", type=float, default=2.0)
@@ -1082,9 +1366,21 @@ def main() -> None:
             "projection_bonus_weight": args.projection_bonus_weight,
             "projection_topk": args.projection_topk,
             "projection_min_score": args.projection_min_score,
+            "projection_anchor_actions": args.projection_anchor_actions,
+            "projection_anchor_topk": args.projection_anchor_topk,
+            "anchor_requires_diffusion_support": args.anchor_requires_diffusion_support,
+            "anchor_min_diffusion_support": args.anchor_min_diffusion_support,
+            "anchor_support_lookahead": args.anchor_support_lookahead,
+            "anchor_diffusion_support_weight": args.anchor_diffusion_support_weight,
+            "execution_alignment_mode": args.execution_alignment_mode,
+            "action_diffusion_support_weight": args.action_diffusion_support_weight,
+            "action_consensus_weight": args.action_consensus_weight,
+            "non_anchor_consensus_weight": args.non_anchor_consensus_weight,
+            "anchor_selection_penalty": args.anchor_selection_penalty,
             "state_conditioning": args.state_conditioning,
             "revisit_penalty": args.revisit_penalty,
             "grounded_fallback": args.grounded_fallback,
+            "strict_projection": args.strict_projection,
             "plan_lookahead": args.plan_lookahead,
             "plan_lookahead_pos_bonus": args.plan_lookahead_pos_bonus,
             "coverage_diversity_bonus": args.coverage_diversity_bonus,

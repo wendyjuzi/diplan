@@ -1,0 +1,15 @@
+{
+  "train_path": "data/clinical_processed/clinical_train.jsonl",
+  "seed": 42,
+  "min_freq": 1,
+  "max_path_len": 32,
+  "batch_size": 256,
+  "emb_dim": 128,
+  "hid_dim": 192,
+  "latent_dim": 128,
+  "lr": 0.0003,
+  "epochs": 4,
+  "length_loss_weight": 0.25,
+  "latent_noise_std": 0.03,
+  "use_cuda": false
+}

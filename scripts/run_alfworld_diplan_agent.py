@@ -207,24 +207,25 @@ def _extract_put_action(action: str) -> Tuple[str, str]:
 def _update_memory(memory: Dict[str, Any], obs: str, action: str, admissible: Sequence[str]) -> None:
     a = action.lower()
     o = obs.lower()
-    if a.startswith("go to "):
+    failed = any(bad in o for bad in ("nothing happens", "you can't", "you cannot", "don't see", "not possible"))
+    if a.startswith("go to ") and not failed:
         memory["current_location"] = _normalize_entity(a.replace("go to ", ""))
         memory["visited"].add(memory["current_location"])
-    if a.startswith("open "):
+    if a.startswith("open ") and not failed:
         memory["opened"].add(_normalize_entity(a.replace("open ", "")))
-    if a.startswith("take "):
+    if a.startswith("take ") and not failed:
         obj, loc = _extract_take_action(a)
         if obj:
             memory["inventory"].add(obj)
             if loc:
                 memory["object_locations"][obj] = loc
-    if a.startswith("put "):
+    if a.startswith("put ") and not failed:
         obj, loc = _extract_put_action(a)
         if obj:
             memory["inventory"].discard(obj)
             if loc:
                 memory["object_locations"][obj] = loc
-    if any(bad in o for bad in ("nothing happens", "you can't", "you cannot", "don't see", "not possible")):
+    if failed:
         memory["failed_actions"].add(a)
 
     for cmd in admissible:
@@ -415,6 +416,18 @@ def _first_error_step(actions: List[str], success: bool) -> int:
     return 1
 
 
+def _has_failure_feedback(obs: str) -> bool:
+    o = str(obs).lower()
+    return any(bad in o for bad in ("nothing happens", "you can't", "you cannot", "don't see", "not possible"))
+
+
+def _first_failure_step(observations: Sequence[str]) -> int:
+    for idx, obs in enumerate(observations, start=1):
+        if _has_failure_feedback(obs):
+            return idx
+    return len(observations) + 1
+
+
 def _is_trap_first_action(action: str, goal_terms: Sequence[str]) -> bool:
     a = action.lower()
     if a in {"help", "look", "inventory"}:
@@ -443,6 +456,7 @@ def _run_episode(env: Any, episode_id: int, args: argparse.Namespace, rng: rando
     action_counts: Counter = Counter()
     actions: List[str] = []
     observations = [obs_text]
+    post_action_observations: List[str] = []
     score = 0.0
     done = False
     candidate_pool_sizes: List[int] = []
@@ -478,13 +492,17 @@ def _run_episode(env: Any, episode_id: int, args: argparse.Namespace, rng: rando
             memory["completed_transforms"].add(spec.get("transform", ""))
         _update_memory(memory, obs_text, action, infos.get("admissible_commands", [[]])[0])
         observations.append(obs_text)
+        post_action_observations.append(obs_text)
         score = float(_first(scores, 0.0))
         done = bool(_first(dones, False))
         if done:
             break
 
     success = bool(done and score > 0)
-    first_error = _first_error_step(actions, success)
+    first_error = _first_failure_step(post_action_observations) if not success else len(actions) + 1
+    feasible_steps = sum(0.0 if _has_failure_feedback(obs) else 1.0 for obs in post_action_observations)
+    plan_feasibility = feasible_steps / max(1, len(actions))
+    constraint_violation = any(_has_failure_feedback(obs) for obs in post_action_observations)
     return {
         "episode_id": episode_id,
         "method": f"alfworld_diplan_{getattr(args, 'variant', 'full')}",
@@ -496,8 +514,8 @@ def _run_episode(env: Any, episode_id: int, args: argparse.Namespace, rng: rando
         "first_error_step": first_error,
         "recovery_at_error": bool(success and first_error <= len(actions)),
         "trap_at_1": bool(actions and _is_trap_first_action(actions[0], goal_terms)),
-        "plan_feasibility": 1.0,
-        "constraint_violation": False,
+        "plan_feasibility": plan_feasibility,
+        "constraint_violation": constraint_violation,
         "plan_execution_consistency": 1.0,
         "candidate_pool_size": sum(candidate_pool_sizes) / max(1, len(candidate_pool_sizes)),
         "memory": {

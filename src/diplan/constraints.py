@@ -11,6 +11,9 @@ layer without creating import cycles.
 from typing import Dict, Iterable, List, Sequence, Set, Tuple
 
 
+SCIENCEWORLD_REENTRY_STAGES = {"NAV", "ACT", "OBSERVE", "VERIFY", "OPERATE"}
+
+
 def action_stage(token: str) -> str:
     """Return the coarse 'stage'/verb of a plan token.
 
@@ -34,6 +37,23 @@ def _matches(token: str, pattern: str) -> bool:
     if not p:
         return False
     return t == p or t.startswith(p) or action_stage(t) == p
+
+
+def _allow_stage_reentry(constraints: Dict) -> bool:
+    if bool(constraints.get("allow_stage_reentry", False)):
+        return True
+    required_stage_order = constraints.get("required_stage_order", [])
+    if not isinstance(required_stage_order, list) or not required_stage_order:
+        return False
+    stages = {str(s).strip().upper() for s in required_stage_order if str(s).strip()}
+    if not stages or not stages.issubset(SCIENCEWORLD_REENTRY_STAGES):
+        return False
+    # ScienceWorld-style symbolic plans frequently revisit NAV/ACT/OBSERVE stages.
+    # When weaker prerequisite constraints are already present, a global monotonic
+    # stage-order check incorrectly marks gold plans infeasible.
+    return isinstance(constraints.get("required_before", {}), dict) or isinstance(
+        constraints.get("must_precede", []), list
+    )
 
 
 def is_feasible(path: List[str], constraints: Dict) -> Tuple[bool, List[str]]:
@@ -61,7 +81,11 @@ def is_feasible(path: List[str], constraints: Dict) -> Tuple[bool, List[str]]:
 
     # Stage order constraints for long-horizon tasks (e.g., clinical workflow).
     required_stage_order = constraints.get("required_stage_order", [])
-    if isinstance(required_stage_order, list) and required_stage_order:
+    if (
+        isinstance(required_stage_order, list)
+        and required_stage_order
+        and not _allow_stage_reentry(constraints)
+    ):
         order_idx = {str(s).strip().upper(): i for i, s in enumerate(required_stage_order)}
         last = -1
         for a in path:

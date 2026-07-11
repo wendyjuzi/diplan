@@ -15,6 +15,16 @@ from src.diplan.io_utils import dump_json, dump_jsonl, ensure_dir
 WORD_RE = re.compile(r"[A-Za-z0-9_\.]+")
 
 
+def _env_call(env, snake_name: str, camel_name: str, *args, **kwargs):
+    fn = getattr(env, snake_name, None)
+    if callable(fn):
+        return fn(*args, **kwargs)
+    fn = getattr(env, camel_name, None)
+    if callable(fn):
+        return fn(*args, **kwargs)
+    raise AttributeError(f"ScienceWorldEnv has neither {snake_name} nor {camel_name}")
+
+
 def _tokenize(text: str, max_len: int = 64) -> List[str]:
     toks = [t.lower() for t in WORD_RE.findall((text or "").lower()) if t]
     return toks[:max_len]
@@ -91,6 +101,7 @@ def _build_constraints(path: List[str]) -> Dict:
     return {
         "max_steps": min(96, max(6, len(path) + 2)),
         "required_stage_order": stages,
+        "allow_stage_reentry": True,
         "must_precede": [{"first": stages[i], "second": stages[i + 1]} for i in range(len(stages) - 1)],
         "required_before": {stages[i + 1]: [stages[i]] for i in range(len(stages) - 1)},
         "forbidden_actions": [],
@@ -121,7 +132,7 @@ def _build_rows_with_path_mode(
     mode = str(path_mode).lower().strip()
     for task in task_names:
         try:
-            max_var = int(env.getMaxVariations(task))
+            max_var = int(_env_call(env, "get_max_variations", "getMaxVariations", task))
         except Exception:
             continue
         if max_var <= 0:
@@ -134,7 +145,7 @@ def _build_rows_with_path_mode(
             try:
                 env.load(task, int(vid), simplification, generateGoldPath=True)
                 obs, _ = env.reset()
-                gold_actions = list(env.getGoldActionSequence() or [])
+                gold_actions = list(_env_call(env, "get_gold_action_sequence", "getGoldActionSequence") or [])
             except Exception:
                 continue
             if not gold_actions:
@@ -149,7 +160,7 @@ def _build_rows_with_path_mode(
                 raise ValueError(f"Unsupported path_mode: {path_mode}")
             if len(oracle_path) < 2:
                 continue
-            question = str(env.getTaskDescription() or obs or task)
+            question = str(_env_call(env, "get_task_description", "getTaskDescription") or obs or task)
             q_tokens = _tokenize(question)
             rows.append(
                 {
@@ -215,7 +226,7 @@ def main() -> None:
 
     env = ScienceWorldEnv("", args.server_path or None, envStepLimit=int(args.env_step_limit))
     try:
-        all_tasks = list(env.getTaskNames())
+        all_tasks = list(_env_call(env, "get_task_names", "getTaskNames"))
         task_names = [t for t in args.task_names if t in all_tasks] if args.task_names else all_tasks
         if not task_names:
             raise ValueError("No valid task names found in ScienceWorld.")

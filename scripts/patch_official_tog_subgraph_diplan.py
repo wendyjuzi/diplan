@@ -38,6 +38,7 @@ import argparse
 import json
 import random
 import sys
+import time
 from pathlib import Path
 from statistics import mean
 
@@ -67,6 +68,16 @@ def run_llm(prompt, temperature, max_tokens, opeani_api_keys, engine="gpt-3.5-tu
     timeout_s = int(os.environ.get("TOG_LLM_TIMEOUT_S", "60"))
     retries = int(os.environ.get("TOG_LLM_RETRIES", "2"))
     max_tokens = min(int(max_tokens), int(os.environ.get("TOG_LLM_MAX_OUTPUT_TOKENS", "96")))
+    stats = globals().setdefault("_TOG_LLM_STATS", {"calls": 0, "errors": 0, "cache_hits": 0, "prompt_tokens": 0, "completion_tokens": 0, "wall_time_s": 0.0})
+    cache_enabled = str(os.environ.get("TOG_LLM_CACHE", "1")).lower() in {"1", "true", "yes", "on"}
+    cache = globals().setdefault("_TOG_LLM_CACHE", {})
+    cache_key = (model, round(float(temperature), 4), int(max_tokens), str(prompt))
+    if cache_enabled and cache_key in cache:
+        stats["cache_hits"] += 1
+        return cache[cache_key]
+    stats["calls"] += 1
+    stats["prompt_tokens"] += len(str(prompt).split())
+    t0 = time.time()
     payload = {
         "model": model,
         "messages": [
@@ -86,15 +97,22 @@ def run_llm(prompt, temperature, max_tokens, opeani_api_keys, engine="gpt-3.5-tu
             req = urllib.request.Request(url, data=data, headers=headers, method="POST")
             with urllib.request.urlopen(req, timeout=timeout_s) as resp:
                 obj = json.loads(resp.read().decode("utf-8"))
-            return str(obj["choices"][0]["message"]["content"]).strip()
+            out = str(obj["choices"][0]["message"]["content"]).strip()
+            stats["completion_tokens"] += len(out.split())
+            stats["wall_time_s"] += time.time() - t0
+            if cache_enabled:
+                cache[cache_key] = out
+            return out
         except urllib.error.HTTPError as exc:
             last_err = f"HTTP {exc.code}: {exc.read().decode('utf-8', errors='ignore')[:300]}"
             if exc.code == 400:
                 raise RuntimeError(last_err)
         except Exception as exc:
             last_err = str(exc)
+        stats["errors"] += 1
         print(f"[ToG LLM] attempt {attempt}/{retries} failed: {last_err}", flush=True)
         time.sleep(min(2 * attempt, 8))
+    stats["wall_time_s"] += time.time() - t0
     raise RuntimeError(f"ToG LLM call failed after {retries} retries: {last_err}")
 
 
@@ -159,8 +177,19 @@ def _is_diplan_strategy(args) -> bool:
     return str(getattr(args, "planning_strategy", "tog")) in {"tog_diplan", "pog_diplan"}
 
 
+def _is_mcts_strategy(args) -> bool:
+    return str(getattr(args, "planning_strategy", "tog")) in {"tog_mcts"}
+
+
 def _is_pog_strategy(args) -> bool:
     return str(getattr(args, "planning_strategy", "tog")) in {"pog", "pog_diplan"}
+
+
+def _timer_add(name: str, elapsed: float, count: int = 1):
+    stats = globals().setdefault("_TOG_STAGE_TIMERS", {})
+    item = stats.setdefault(name, {"wall_time_s": 0.0, "calls": 0})
+    item["wall_time_s"] += float(elapsed)
+    item["calls"] += int(count)
 
 
 class LocalSubgraphBackend:
@@ -278,6 +307,10 @@ def relation_label(relation: str) -> str:
 
 
 def relation_search_prune_local(backend: LocalSubgraphBackend, entity_id, entity_name, pre_relations, pre_head, question, args):
+    _stage_t0 = time.time()
+    def _finish(value):
+        _timer_add("relation_prune", time.time() - _stage_t0)
+        return value
     head_relations, tail_relations = backend.relations(
         entity_id,
         pre_relations,
@@ -286,14 +319,15 @@ def relation_search_prune_local(backend: LocalSubgraphBackend, entity_id, entity
     )
     total_relations = sorted(set(head_relations + tail_relations))
     if not total_relations:
-        return []
+        return _finish([])
     max_prompt_relations = int(getattr(args, "max_prompt_relations", 64))
     prompt_relations = sorted(total_relations, key=lambda r: (-_overlap(relation_label(r), question), r))[:max_prompt_relations]
     rerank_pool_size = 0
     pool_strategy = str(getattr(args, "diplan_pool_strategy", "lexical"))
-    if _is_diplan_strategy(args):
+    if _is_diplan_strategy(args) or _is_mcts_strategy(args):
         rerank_pool_size = int(getattr(args, "diplan_rerank_pool_size", 0))
-    if args.prune_tools == "llm":
+    relation_prune_tools = str(getattr(args, "relation_prune_tools", "") or getattr(args, "prune_tools", "llm"))
+    if relation_prune_tools == "llm":
         # Use official ToG relation-prune prompt, but expose human-readable labels
         # while keeping original relation IDs parseable by clean_relations.
         labelled = [f"{r} (label: {relation_label(r)})" for r in prompt_relations]
@@ -306,7 +340,7 @@ def relation_search_prune_local(backend: LocalSubgraphBackend, entity_id, entity
             flag, rels = clean_relations(result, entity_id, head_relations)
             if flag:
                 if rerank_pool_size > args.width:
-                    return _expand_relation_pool(
+                    return _finish(_expand_relation_pool(
                         entity_id,
                         rels,
                         total_relations,
@@ -314,8 +348,8 @@ def relation_search_prune_local(backend: LocalSubgraphBackend, entity_id, entity
                         question,
                         rerank_pool_size,
                         pool_strategy=pool_strategy,
-                    )
-                return rels
+                    ))
+                return _finish(rels)
         except Exception as exc:
             print(f"[ToG relation prune] LLM failed, fallback to lexical: {exc}", flush=True)
     # Deterministic fallback: relation-label lexical overlap.
@@ -325,10 +359,10 @@ def relation_search_prune_local(backend: LocalSubgraphBackend, entity_id, entity
         limit = rerank_pool_size if rerank_pool_size > args.width else args.width
     ranked_all = _rank_pool_relations(total_relations, question, pool_strategy)
     ranked = ranked_all[: limit]
-    return [
+    return _finish([
         {"entity": entity_id, "relation": r, "score": 1.0 / (i + 1), "head": r in head_relations}
         for i, r in enumerate(ranked)
-    ]
+    ])
 
 
 def _expand_relation_pool(entity_id, seed_rels, total_relations, head_relations, question, pool_size, pool_strategy="lexical"):
@@ -384,17 +418,32 @@ def _overlap(text: str, question: str) -> float:
 
 
 def entity_score_local(backend: LocalSubgraphBackend, question, entity_candidates_id, score, relation, args):
+    _stage_t0 = time.time()
+    def _finish(value):
+        _timer_add("entity_prune", time.time() - _stage_t0)
+        return value
     entity_candidates = [backend.id2name(eid) for eid in entity_candidates_id]
     if len(entity_candidates) == 0:
-        return [0.0], [], []
+        return _finish(([0.0], [], []))
     if len(entity_candidates) == 1:
-        return [score], entity_candidates, entity_candidates_id
-    if args.prune_tools == "llm":
+        return _finish(([score], entity_candidates, entity_candidates_id))
+    entity_prune_tools = str(getattr(args, "entity_prune_tools", "") or getattr(args, "prune_tools", "llm"))
+    if entity_prune_tools == "llm":
         prompt = construct_entity_score_prompt(question, relation, entity_candidates)
         result = run_llm(prompt, args.temperature_exploration, args.max_length, args.opeani_api_keys, args.LLM_type)
-        return [float(x) * score for x in clean_scores(result, entity_candidates)], entity_candidates, entity_candidates_id
+        return _finish(([float(x) * score for x in clean_scores(result, entity_candidates)], entity_candidates, entity_candidates_id))
+    if entity_prune_tools in {"lexical", "heuristic"}:
+        q = {t.lower() for t in question.replace("?", " ").replace(",", " ").split() if t}
+        vals = []
+        for name in entity_candidates:
+            toks = {t.lower() for t in str(name).replace("_", " ").replace(".", " ").split() if t}
+            overlap = len(q & toks) / max(1, len(toks))
+            vals.append(float(score) * (0.25 + overlap))
+        if not vals:
+            vals = [float(score) / max(1, len(entity_candidates))]
+        return _finish((vals, entity_candidates, entity_candidates_id))
     # fallback: keep equal mass
-    return [score / len(entity_candidates)] * len(entity_candidates), entity_candidates, entity_candidates_id
+    return _finish(([score / len(entity_candidates)] * len(entity_candidates), entity_candidates, entity_candidates_id))
 
 
 class DiPLaNReranker:
@@ -403,6 +452,18 @@ class DiPLaNReranker:
         self.calls = 0
         self.candidate_count_sum = 0
         self.top_changed = 0
+        self.wall_time_sum = 0.0
+        self.value_items = 0
+        self.prior_samples = 0
+        self.guided_rollout_paths = 0
+        self.fusion_items = 0
+        self.value_wall_time_sum = 0.0
+        self.prior_wall_time_sum = 0.0
+        self.question_wall_time_sum = 0.0
+        self.candidate_diffusion_wall_time_sum = 0.0
+        self.trajectory_diffusion_wall_time_sum = 0.0
+        self.guided_wall_time_sum = 0.0
+        self.fusion_wall_time_sum = 0.0
         self.value_std_sum = 0.0
         self.prior_std_sum = 0.0
         self.question_std_sum = 0.0
@@ -492,6 +553,7 @@ class DiPLaNReranker:
         if not self.enabled or not candidates:
             self.last_debug = None
             return candidates
+        t0 = time.time()
         self.calls += 1
         self.candidate_count_sum += len(candidates)
         original_top = candidates[0]["relation"]
@@ -500,6 +562,7 @@ class DiPLaNReranker:
         emb_cov = _embedding_coverage([c["relation"] for c in candidates], self.bundle.path_vocab, self.path_embedding)
         self.embedding_coverage_sum += emb_cov
         paths = [list(executed_prefix) + [c["relation"]] for c in candidates]
+        _phase_t0 = time.time()
         raw_value_scores = self.score_candidates_with_value(
             self.bundle.value_model,
             self.bundle.path_vocab,
@@ -510,6 +573,8 @@ class DiPLaNReranker:
             max_query_len=32,
             max_path_len=30,
         )
+        self.value_wall_time_sum += time.time() - _phase_t0
+        self.value_items += len(paths)
         self.value_std_sum += _std(raw_value_scores)
         value_scores = _z_norm(raw_value_scores)
         fusion_feature_names = list(getattr(self.fusion_ranker, "feature_names", []) or [])
@@ -521,6 +586,7 @@ class DiPLaNReranker:
         prior_scores = [0.0 for _ in candidates]
         sampled_paths = []
         if needs_prior_scores:
+            _phase_t0 = time.time()
             sampled_paths = self.sample_plan_candidates(
                 planner=self.bundle.planner,
                 autoencoder=self.bundle.autoencoder,
@@ -539,6 +605,7 @@ class DiPLaNReranker:
                 planner_type=self.bundle.planner_type,
                 jitter_std=self.bundle.jitter_std,
             )
+            self.prior_samples += len(sampled_paths)
             prior_scores = _candidate_diffusion_prior(
                 [c["relation"] for c in candidates],
                 sampled_paths,
@@ -552,6 +619,8 @@ class DiPLaNReranker:
             if any(abs(float(x)) > 1e-12 for x in prior_scores):
                 self.prior_nonzero_calls += 1
             prior_scores = _z_norm(prior_scores)
+            self.prior_wall_time_sum += time.time() - _phase_t0
+        _phase_t0 = time.time()
         if self.relation_scorer is not None:
             raw_question_scores = self.score_relations(
                 self.relation_scorer,
@@ -574,8 +643,10 @@ class DiPLaNReranker:
                 float(x) + self.schema_prior_weight * float(s)
                 for x, s in zip(raw_question_scores, schema_scores)
             ]
+        self.question_wall_time_sum += time.time() - _phase_t0
         self.question_std_sum += _std(raw_question_scores)
         question_scores = _z_norm(raw_question_scores)
+        _phase_t0 = time.time()
         if self.candidate_diffusion is not None:
             raw_candidate_diffusion_scores = self.score_candidate_relations(
                 self.candidate_diffusion,
@@ -586,8 +657,10 @@ class DiPLaNReranker:
             )
         else:
             raw_candidate_diffusion_scores = [0.0 for _ in candidates]
+        self.candidate_diffusion_wall_time_sum += time.time() - _phase_t0
         self.candidate_diffusion_std_sum += _std(raw_candidate_diffusion_scores)
         candidate_diffusion_scores = _z_norm(raw_candidate_diffusion_scores)
+        _phase_t0 = time.time()
         if self.trajectory_diffusion is not None:
             raw_trajectory_diffusion_scores = self.score_first_relations(
                 self.trajectory_diffusion,
@@ -599,18 +672,22 @@ class DiPLaNReranker:
             )
         else:
             raw_trajectory_diffusion_scores = [0.0 for _ in candidates]
+        self.trajectory_diffusion_wall_time_sum += time.time() - _phase_t0
         self.trajectory_diffusion_std_sum += _std(raw_trajectory_diffusion_scores)
         trajectory_diffusion_scores = _z_norm(raw_trajectory_diffusion_scores)
         combined_prior_scores = _z_norm([
             float(p) + self.question_weight * float(q)
             for p, q in zip(prior_scores, question_scores)
         ])
+        _phase_t0 = time.time()
         guided_paths, guided_state_paths, raw_guided_scores, guided_value_stats = self._guided_rollout_scores(
             backend,
             candidates,
             executed_prefix,
             query_tokens,
         )
+        self.guided_wall_time_sum += time.time() - _phase_t0
+        self.guided_rollout_paths += len(guided_paths)
         self.guided_std_sum += _std(raw_guided_scores)
         guided_scores = _z_norm(raw_guided_scores)
         fusion_features = _fusion_features(
@@ -626,10 +703,13 @@ class DiPLaNReranker:
             guided_scores,
             feature_names=fusion_feature_names,
         )
+        _phase_t0 = time.time()
         if self.fusion_ranker is not None:
             raw_fusion_scores = self.score_fusion(self.fusion_ranker, fusion_features)
         else:
             raw_fusion_scores = [0.0 for _ in candidates]
+        self.fusion_wall_time_sum += time.time() - _phase_t0
+        self.fusion_items += len(candidates)
         self.fusion_std_sum += _std(raw_fusion_scores)
         fusion_scores = _z_norm(raw_fusion_scores)
         out = []
@@ -721,6 +801,8 @@ class DiPLaNReranker:
         out = sorted(out, key=lambda x: x["score"], reverse=True)
         if out and out[0]["relation"] != original_top:
             self.top_changed += 1
+        elapsed = time.time() - t0
+        self.wall_time_sum += elapsed
         self.last_debug = {
             "num_candidates": len(candidates),
             "before_top": before_top,
@@ -738,6 +820,7 @@ class DiPLaNReranker:
             "fusion_std": _std(raw_fusion_scores),
             "embedding_coverage": emb_cov,
             "top_changed": bool(out and out[0]["relation"] != original_top),
+            "rerank_wall_time_s": elapsed,
         }
         return out
 
@@ -890,6 +973,19 @@ class DiPLaNReranker:
             "diplan_score_mode": getattr(self, "score_mode", "disabled"),
             "diplan_rerank_calls": self.calls,
             "diplan_avg_candidates_per_call": self.candidate_count_sum / denom,
+            "diplan_rerank_wall_time_s": self.wall_time_sum,
+            "diplan_rerank_wall_time_per_call": self.wall_time_sum / denom,
+            "diplan_value_wall_time_s": self.value_wall_time_sum,
+            "diplan_prior_wall_time_s": self.prior_wall_time_sum,
+            "diplan_question_wall_time_s": self.question_wall_time_sum,
+            "diplan_candidate_diffusion_wall_time_s": self.candidate_diffusion_wall_time_sum,
+            "diplan_trajectory_diffusion_wall_time_s": self.trajectory_diffusion_wall_time_sum,
+            "diplan_guided_wall_time_s": self.guided_wall_time_sum,
+            "diplan_fusion_wall_time_s": self.fusion_wall_time_sum,
+            "diplan_value_items": self.value_items,
+            "diplan_prior_samples": self.prior_samples,
+            "diplan_guided_rollout_paths": self.guided_rollout_paths,
+            "diplan_fusion_items": self.fusion_items,
             "diplan_top_changed_rate": self.top_changed / denom,
             "diplan_value_std_mean": self.value_std_sum / denom,
             "diplan_prior_std_mean": self.prior_std_sum / denom,
@@ -900,6 +996,440 @@ class DiPLaNReranker:
             "diplan_fusion_std_mean": self.fusion_std_sum / denom,
             "diplan_prior_nonzero_rate": self.prior_nonzero_calls / denom,
             "diplan_embedding_coverage_mean": self.embedding_coverage_sum / denom,
+        }
+
+
+class MCTSRelationReranker:
+    """FLARE/MCTS-style relation reranker for the official ToG pipeline.
+
+    ``mcts_eval_mode`` controls the rollout evaluator:
+      * heuristic: cheap lexical scoring (the original lightweight baseline)
+      * llm: ask the LLM to score each simulated future relation trajectory
+      * neural/trained: score trajectories with the trained DiPLaN value model
+        and optionally use a trained relation scorer as a PUCT policy prior
+    """
+
+    def __init__(self, args):
+        self.args = args
+        self.calls = 0
+        self.candidate_count_sum = 0
+        self.wall_time_sum = 0.0
+        self.simulations = 0
+        self.expanded_nodes = 0
+        self.rollout_steps = 0
+        self.trajectory_evals = 0
+        self.value_items = 0
+        self.mcts_llm_eval_calls = 0
+        self.mcts_neural_eval_items = 0
+        self.mcts_llm_eval_wall_time_sum = 0.0
+        self.mcts_neural_eval_wall_time_sum = 0.0
+        self.mcts_memory_hits = 0
+        self.mcts_memory_writes = 0
+        self.S = int(getattr(args, "mcts_sims", 16))
+        self.c = float(getattr(args, "mcts_ucb_c", 1.4))
+        self.H = int(getattr(args, "mcts_horizon", getattr(args, "diplan_horizon", 3)))
+        self.k = int(getattr(args, "mcts_k", getattr(args, "width", 8)))
+        self.rng = random.Random(int(getattr(args, "seed", 42)))
+        self.value_weight = float(getattr(args, "mcts_value_weight", 1.0))
+        self.eval_mode = str(getattr(args, "mcts_eval_mode", "heuristic"))
+        if self.eval_mode == "trained":
+            self.eval_mode = "neural"
+        if self.eval_mode == "flare":
+            self.eval_mode = "llm"
+            setattr(args, "mcts_use_memory", True)
+        self.llm_max_tokens = int(getattr(args, "mcts_llm_max_tokens", 24))
+        self.use_memory = bool(getattr(args, "mcts_use_memory", False))
+        self.memory_sim_threshold = float(getattr(args, "mcts_memory_sim", 0.9))
+        self.memory_cap = int(getattr(args, "mcts_memory_cap", 200))
+        self._trajectory_memory = []
+        self.commitment_mode = str(getattr(args, "mcts_commitment", "receding"))
+        self._pending_plan = []
+        self.policy_prior_mode = str(getattr(args, "mcts_policy_prior", "none"))
+        self.policy_prior_weight = float(getattr(args, "mcts_policy_prior_weight", 0.0))
+        self.puct_c = float(getattr(args, "mcts_puct_c", self.c))
+        self._llm_eval_cache = {}
+        self.bundle = None
+        self.score_candidates_with_value = None
+        self.relation_scorer = None
+        self.score_relations = None
+        if self.eval_mode == "neural":
+            _repo_root_from_diplan_arg(args.diplan_repo)
+            from src.diplan.planners import load_diffusion_bundle
+            from src.diplan.inference import score_candidates_with_value
+
+            self.score_candidates_with_value = score_candidates_with_value
+            self.bundle = load_diffusion_bundle(
+                args.diplan_ae_ckpt,
+                args.diplan_planner_ckpt,
+                args.diplan_value_ckpt,
+                {
+                    "diffusion": {
+                        "num_candidates": args.diplan_num_candidates,
+                        "diffusion_steps": args.diplan_diffusion_steps,
+                        "use_prefix": True,
+                        "jitter_std": args.diplan_jitter_std,
+                    }
+                },
+            )
+        if self.policy_prior_mode in {"auto", "relation_scorer"} and getattr(args, "diplan_relation_scorer_ckpt", ""):
+            _repo_root_from_diplan_arg(args.diplan_repo)
+            from src.diplan.relation_scorer import load_relation_scorer, score_relations
+
+            self.relation_scorer = load_relation_scorer(args.diplan_relation_scorer_ckpt)
+            self.score_relations = score_relations
+        self.last_debug = None
+
+    def _ucb(self, node, idx):
+        if node["na"].get(idx, 0) == 0:
+            return float("inf")
+        if self.policy_prior_mode != "none" and node.get("p"):
+            prior = float(node["p"][idx]) if idx < len(node["p"]) else 0.0
+            return node["q"][idx] + self.puct_c * prior * ((node["n"] + 1) ** 0.5) / (1 + node["na"][idx])
+        return node["q"][idx] + self.c * ((node["n"] ** 0.5) / ((node["na"][idx] + 1) ** 0.5))
+
+    def _softmax(self, vals):
+        if not vals:
+            return []
+        import math
+
+        mx = max(float(v) for v in vals)
+        exps = [math.exp(max(-50.0, min(50.0, float(v) - mx))) for v in vals]
+        denom = sum(exps) or 1.0
+        return [x / denom for x in exps]
+
+    def _policy_priors(self, backend, candidates, executed_prefix):
+        if self.policy_prior_mode == "none" or not candidates:
+            return []
+        if self.policy_prior_mode in {"auto", "relation_scorer"} and self.relation_scorer is not None:
+            query_tokens = list(backend.row.get("query_tokens") or backend.question.split())
+            vals = self.score_relations(
+                self.relation_scorer,
+                backend.question,
+                query_tokens,
+                [c["relation"] for c in candidates],
+                executed_prefix=executed_prefix,
+            )
+            return self._softmax(vals)
+        if self.policy_prior_mode == "relation_scorer":
+            return []
+        vals = [float(c.get("score", 0.0)) for c in candidates]
+        return self._softmax(vals)
+
+    def _score_trajectory_heuristic(self, backend, traj):
+        if not traj:
+            return 0.0
+        score = 0.0
+        for rel in traj:
+            score += _overlap(relation_label(rel), backend.question)
+        score += 0.05 * len([r for r in traj if r])
+        score -= 0.03 * max(0, len(traj) - 1)
+        return score
+
+    def _score_trajectory_llm(self, backend, traj, executed_prefix):
+        if not traj:
+            return 0.0
+        key = (backend.question, tuple(executed_prefix), tuple(traj))
+        if key in self._llm_eval_cache:
+            return self._llm_eval_cache[key]
+        if self.use_memory:
+            mem = self._lookup_trajectory_memory(backend.question, executed_prefix, traj)
+            if mem is not None:
+                self.mcts_memory_hits += 1
+                self._llm_eval_cache[key] = mem
+                return mem
+        prompt = (
+            "You are evaluating a candidate reasoning trajectory over a knowledge graph.\n"
+            "Score how likely the future relation sequence helps answer the question.\n"
+            "Return only one number from 0 to 1.\n\n"
+            f"Question: {backend.question}\n"
+            f"Executed prefix: {' -> '.join(executed_prefix) if executed_prefix else '(none)'}\n"
+            f"Candidate future relations: {' -> '.join(traj)}\n"
+            "Score:"
+        )
+        self.mcts_llm_eval_calls += 1
+        _eval_t0 = time.time()
+        out = run_llm(
+            prompt,
+            getattr(self.args, "temperature_exploration", 0.1),
+            self.llm_max_tokens,
+            getattr(self.args, "opeani_api_keys", "EMPTY"),
+            getattr(self.args, "LLM_type", "gpt-3.5-turbo"),
+        )
+        self.mcts_llm_eval_wall_time_sum += time.time() - _eval_t0
+        import re
+
+        nums = re.findall(r"[-+]?\d*\.?\d+", str(out))
+        val = float(nums[0]) if nums else 0.0
+        if val > 1.0:
+            val = val / 100.0 if val <= 100.0 else 1.0
+        val = max(0.0, min(1.0, val))
+        self._llm_eval_cache[key] = val
+        if self.use_memory:
+            self._write_trajectory_memory(backend.question, executed_prefix, traj, val)
+        return val
+
+    def _score_trajectory_neural(self, backend, traj, executed_prefix):
+        if not traj or self.bundle is None or self.score_candidates_with_value is None:
+            return self._score_trajectory_heuristic(backend, traj)
+        query_tokens = list(backend.row.get("query_tokens") or backend.question.split())
+        path = list(executed_prefix) + list(traj)
+        _eval_t0 = time.time()
+        vals = self.score_candidates_with_value(
+            self.bundle.value_model,
+            self.bundle.path_vocab,
+            self.bundle.query_vocab,
+            query_tokens,
+            [path],
+            self.bundle.device,
+            max_query_len=32,
+            max_path_len=30,
+        )
+        self.mcts_neural_eval_wall_time_sum += time.time() - _eval_t0
+        self.mcts_neural_eval_items += 1
+        return float(vals[0]) if vals else 0.0
+
+    def _traj_signature(self, question, executed_prefix, traj):
+        q = tuple(str(x).lower() for x in str(question).replace("?", " ").split() if x)
+        return (q, tuple(executed_prefix), tuple(traj))
+
+    def _traj_similarity(self, a, b):
+        aq, ap, at = a
+        bq, bp, bt = b
+        if aq != bq or ap != bp:
+            return 0.0
+        aset = set(at)
+        bset = set(bt)
+        if not aset and not bset:
+            return 1.0
+        return len(aset & bset) / max(1, len(aset | bset))
+
+    def _lookup_trajectory_memory(self, question, executed_prefix, traj):
+        sig = self._traj_signature(question, executed_prefix, traj)
+        best = None
+        best_sim = 0.0
+        for mem_sig, value in self._trajectory_memory:
+            sim = self._traj_similarity(sig, mem_sig)
+            if sim > best_sim:
+                best_sim = sim
+                best = value
+        if best is not None and best_sim >= self.memory_sim_threshold:
+            return float(best)
+        return None
+
+    def _write_trajectory_memory(self, question, executed_prefix, traj, value):
+        sig = self._traj_signature(question, executed_prefix, traj)
+        self._trajectory_memory.append((sig, float(value)))
+        self.mcts_memory_writes += 1
+        if len(self._trajectory_memory) > max(1, self.memory_cap):
+            self._trajectory_memory = self._trajectory_memory[-max(1, self.memory_cap):]
+
+    def _score_trajectory(self, backend, traj, executed_prefix):
+        self.trajectory_evals += 1
+        if self.eval_mode == "llm":
+            return self._score_trajectory_llm(backend, traj, executed_prefix)
+        if self.eval_mode == "neural":
+            return self._score_trajectory_neural(backend, traj, executed_prefix)
+        return self._score_trajectory_heuristic(backend, traj)
+
+    def _candidate_next_entities(self, backend, cand):
+        return backend.entity_search(cand["entity"], cand["relation"], bool(cand["head"]))
+
+    def _expand_lookahead_candidates(self, backend, entities, executed_prefix, depth_offset):
+        """Expand legal relation actions from simulated future entities.
+
+        This is the explicit lookahead part: after simulating action_t, we derive
+        the next state entities and ask the same ToG relation proposer for
+        action_{t+1}, rather than repeatedly ranking only root actions.
+        """
+        out = []
+        if not entities:
+            return out
+        pre_rels = list(executed_prefix)
+        pre_heads = [-1 for _ in entities]
+        # Keep lookahead branching bounded; MCTS simulations provide breadth.
+        max_entities = max(1, min(len(entities), int(getattr(self.args, "num_retain_entity", 5))))
+        for i, ent in enumerate(list(entities)[:max_entities]):
+            rels = relation_search_prune_local(
+                backend,
+                str(ent),
+                backend.id2name(str(ent)),
+                pre_rels,
+                pre_heads[i],
+                backend.question,
+                self.args,
+            )
+            for r in rels[: max(1, self.k)]:
+                cc = dict(r)
+                cc["lookahead_depth"] = int(depth_offset)
+                out.append(cc)
+        out.sort(key=lambda x: float(x.get("score", 0.0)), reverse=True)
+        return out[: max(1, self.k)]
+
+    def _simulate(self, backend, root, executed_prefix):
+        self.simulations += 1
+        node = root
+        path = []
+        traj = []
+        frontier_entities = None
+        for _ in range(self.H):
+            if not node["untried"]:
+                break
+            unexpanded = [i for i in range(len(node["untried"])) if i not in node["children"]]
+            if unexpanded:
+                idx = self.rng.choice(unexpanded)
+                cand = node["untried"][idx]
+                next_entities = self._candidate_next_entities(backend, cand)
+                child_candidates = self._expand_lookahead_candidates(
+                    backend,
+                    next_entities,
+                    list(executed_prefix) + traj + [cand["relation"]],
+                    len(traj) + 1,
+                )
+                node["children"][idx] = {
+                    "n": 0,
+                    "q": {},
+                    "na": {},
+                    "p": [],
+                    "untried": child_candidates,
+                    "children": {},
+                }
+                path.append((node, idx))
+                traj.append(cand["relation"])
+                frontier_entities = next_entities
+                self.expanded_nodes += 1
+                node = node["children"][idx]
+                continue
+            idx = max(range(len(node["untried"])), key=lambda i: self._ucb(node, i))
+            cand = node["untried"][idx]
+            path.append((node, idx))
+            traj.append(cand["relation"])
+            next_entities = self._candidate_next_entities(backend, cand)
+            frontier_entities = next_entities
+            if idx not in node["children"]:
+                child_candidates = self._expand_lookahead_candidates(
+                    backend,
+                    next_entities,
+                    list(executed_prefix) + traj,
+                    len(traj),
+                )
+                node["children"][idx] = {"n": 0, "q": {}, "na": {}, "p": [], "untried": child_candidates, "children": {}}
+            node = node["children"][idx]
+            if not node["untried"] and not frontier_entities:
+                break
+        self.rollout_steps += len(traj)
+        ret = self._score_trajectory(backend, traj, executed_prefix)
+        for n, idx in path:
+            n["n"] += 1
+            n["na"][idx] = n["na"].get(idx, 0) + 1
+            n["q"][idx] = n["q"].get(idx, 0.0) + (ret - n["q"].get(idx, 0.0)) / n["na"][idx]
+
+    def rerank(self, backend: LocalSubgraphBackend, candidates, executed_prefix):
+        if not candidates:
+            self.last_debug = None
+            return candidates
+        if self.commitment_mode == "full" and self._pending_plan:
+            next_rel = self._pending_plan.pop(0)
+            boosted = []
+            for cand in candidates:
+                cc = dict(cand)
+                if cc.get("relation") == next_rel:
+                    cc["score"] = float(cc.get("score", 0.0)) + 1e6
+                    cc["mcts_full_commitment_reused"] = True
+                boosted.append(cc)
+            boosted.sort(key=lambda x: x["score"], reverse=True)
+            self.last_debug = {
+                "planner": "mcts",
+                "mcts_commitment": self.commitment_mode,
+                "pending_plan_reused": True,
+                "committed_relation": next_rel,
+                "before_top": _compact_relation_list(candidates, topk=8),
+                "after_top": _compact_relation_list(boosted, topk=8),
+            }
+            return boosted
+        t0 = time.time()
+        self.calls += 1
+        self.candidate_count_sum += len(candidates)
+        self.value_items += len(candidates)
+        priors = self._policy_priors(backend, candidates, executed_prefix)
+        root = {"n": 0, "q": {}, "na": {}, "p": priors, "untried": list(candidates), "children": {}}
+        for _ in range(max(1, self.S)):
+            self._simulate(backend, root, executed_prefix)
+        committed_plan = []
+        scored = []
+        for idx, cand in enumerate(candidates):
+            q = root["q"].get(idx, 0.0)
+            n = root["na"].get(idx, 0)
+            prior = float(priors[idx]) if idx < len(priors) else 0.0
+            cc = dict(cand)
+            cc["mcts_value_score"] = float(q)
+            cc["mcts_visit_count"] = int(n)
+            cc["mcts_policy_prior"] = float(prior)
+            cc["score"] = (
+                float(cc.get("score", 0.0))
+                + self.value_weight * float(q)
+                + self.policy_prior_weight * prior
+                + 0.01 * float(n)
+            )
+            scored.append(cc)
+        scored.sort(key=lambda x: x["score"], reverse=True)
+        if self.commitment_mode == "full" and scored:
+            best_idx = next((i for i, c in enumerate(candidates) if c.get("relation") == scored[0].get("relation")), 0)
+            best_child = root["children"].get(best_idx, {})
+            committed_plan = [scored[0].get("relation")]
+            # Greedily read out the highest-value child path from the built tree.
+            node = best_child
+            while node and node.get("untried") and len(committed_plan) < self.H:
+                q = node.get("q", {})
+                if not q:
+                    break
+                j = max(q, key=q.get)
+                if j >= len(node["untried"]):
+                    break
+                committed_plan.append(node["untried"][j].get("relation"))
+                node = node.get("children", {}).get(j)
+            self._pending_plan = list(committed_plan[1:])
+        elapsed = time.time() - t0
+        self.wall_time_sum += elapsed
+        self.last_debug = {
+            "planner": "mcts",
+            "before_top": _compact_relation_list(candidates, topk=8),
+            "after_top": _compact_relation_list(scored, topk=8),
+            "top_changed": bool(scored and candidates and scored[0].get("relation") != candidates[0].get("relation")),
+            "rerank_wall_time_s": elapsed,
+            "mcts_simulations": self.S,
+            "mcts_eval_mode": self.eval_mode,
+            "mcts_policy_prior": self.policy_prior_mode,
+            "mcts_commitment": self.commitment_mode,
+            "committed_plan": committed_plan,
+        }
+        return scored
+
+    def diagnostics(self):
+        denom = max(1, self.calls)
+        return {
+            "mcts_enabled": True,
+            "mcts_eval_mode": self.eval_mode,
+            "mcts_policy_prior": self.policy_prior_mode,
+            "mcts_policy_prior_weight": self.policy_prior_weight,
+            "mcts_commitment": self.commitment_mode,
+            "mcts_calls": self.calls,
+            "mcts_candidate_count_mean": self.candidate_count_sum / denom,
+            "mcts_rerank_wall_time_s": self.wall_time_sum,
+            "mcts_rerank_wall_time_per_call": self.wall_time_sum / denom,
+            "mcts_sims_per_call": self.S,
+            "mcts_simulations": self.simulations,
+            "mcts_expanded_nodes": self.expanded_nodes,
+            "mcts_rollout_steps": self.rollout_steps,
+            "mcts_trajectory_evals": self.trajectory_evals,
+            "mcts_value_items": self.value_items,
+            "mcts_llm_eval_calls": self.mcts_llm_eval_calls,
+            "mcts_llm_eval_wall_time_s": self.mcts_llm_eval_wall_time_sum,
+            "mcts_neural_eval_items": self.mcts_neural_eval_items,
+            "mcts_neural_eval_wall_time_s": self.mcts_neural_eval_wall_time_sum,
+            "mcts_use_memory": self.use_memory,
+            "mcts_memory_hits": self.mcts_memory_hits,
+            "mcts_memory_writes": self.mcts_memory_writes,
+            "mcts_memory_size": len(self._trajectory_memory),
         }
 
 
@@ -1666,7 +2196,9 @@ def main():
     parser.add_argument("--opeani_api_keys", type=str, default="EMPTY")
     parser.add_argument("--num_retain_entity", type=int, default=5)
     parser.add_argument("--prune_tools", type=str, default="llm")
-    parser.add_argument("--planning_strategy", type=str, default="tog_diplan", choices=["tog", "tog_diplan", "pog", "pog_diplan"])
+    parser.add_argument("--relation_prune_tools", type=str, default="", choices=["", "llm", "lexical"])
+    parser.add_argument("--entity_prune_tools", type=str, default="", choices=["", "llm", "lexical", "heuristic", "none"])
+    parser.add_argument("--planning_strategy", type=str, default="tog_diplan", choices=["tog", "tog_diplan", "tog_mcts", "pog", "pog_diplan"])
     parser.add_argument("--selection_mode", type=str, default="entity_prune", choices=["entity_prune", "relation_first"])
     parser.add_argument("--relation_first_k", type=int, default=0)
     parser.add_argument("--diplan_repo", default="/root/autodl-tmp/DiPLaN")
@@ -1721,6 +2253,20 @@ def main():
     parser.add_argument("--pog_memory_weight", type=float, default=0.4)
     parser.add_argument("--pog_reflection_weight", type=float, default=0.25)
     parser.add_argument("--pog_fanout_penalty", type=float, default=0.12)
+    parser.add_argument("--mcts_sims", type=int, default=16)
+    parser.add_argument("--mcts_ucb_c", type=float, default=1.4)
+    parser.add_argument("--mcts_horizon", type=int, default=3)
+    parser.add_argument("--mcts_k", type=int, default=8)
+    parser.add_argument("--mcts_value_weight", type=float, default=1.0)
+    parser.add_argument("--mcts_eval_mode", type=str, default="heuristic", choices=["heuristic", "llm", "flare", "neural", "trained"])
+    parser.add_argument("--mcts_policy_prior", type=str, default="none", choices=["none", "base_score", "relation_scorer", "auto"])
+    parser.add_argument("--mcts_policy_prior_weight", type=float, default=0.0)
+    parser.add_argument("--mcts_puct_c", type=float, default=1.4)
+    parser.add_argument("--mcts_llm_max_tokens", type=int, default=24)
+    parser.add_argument("--mcts_use_memory", type=_str2bool, default=False)
+    parser.add_argument("--mcts_memory_cap", type=int, default=200)
+    parser.add_argument("--mcts_memory_sim", type=float, default=0.9)
+    parser.add_argument("--mcts_commitment", type=str, default="receding", choices=["receding", "full"])
     parser.add_argument("--diplan_rerank_pool_size", type=int, default=16)
     parser.add_argument("--diplan_post_rerank_topk", type=int, default=0)
     parser.add_argument("--diplan_num_candidates", type=int, default=16)
@@ -1747,7 +2293,9 @@ def main():
 
     rows = _load_jsonl(args.subgraph_jsonl, args.max_tasks)
     reranker = DiPLaNReranker(args) if _is_diplan_strategy(args) else None
+    mcts_reranker = MCTSRelationReranker(args) if _is_mcts_strategy(args) else None
     Path(args.out).mkdir(parents=True, exist_ok=True)
+    run_start_time = time.time()
     pred_path = Path(args.out) / "predictions.jsonl"
     trace_path = Path(args.out) / "trace.jsonl"
     records = []
@@ -1820,6 +2368,13 @@ def main():
                     if reranker is not None:
                         rels = reranker.rerank(backend, rels, executed)
                         ent_trace["rerank"] = reranker.last_debug
+                        post_topk = int(args.diplan_post_rerank_topk or args.width)
+                        ent_trace["oracle_rank_after_rerank_full"] = _relation_rank(rels, oracle_next)
+                        ent_trace["dynamic_rank_after_rerank_full"] = _best_relation_rank(rels, valid_next_relations)
+                        rels = rels[: max(1, post_topk)]
+                    elif mcts_reranker is not None:
+                        rels = mcts_reranker.rerank(backend, rels, executed)
+                        ent_trace["rerank"] = mcts_reranker.last_debug
                         post_topk = int(args.diplan_post_rerank_topk or args.width)
                         ent_trace["oracle_rank_after_rerank_full"] = _relation_rank(rels, oracle_next)
                         ent_trace["dynamic_rank_after_rerank_full"] = _best_relation_rank(rels, valid_next_relations)
@@ -1920,7 +2475,9 @@ def main():
                 total_entities_id, total_topic_entities, total_head = [], [], []
                 answer_vote_entities_id, answer_vote_scores = [], []
                 for ent in current_entity_relations_list:
+                    _stage_t0 = time.time()
                     entity_candidates_id = backend.entity_search(ent["entity"], ent["relation"], bool(ent["head"]))
+                    _timer_add("entity_search", time.time() - _stage_t0)
                     if len(entity_candidates_id) >= 20:
                         entity_candidates_id = random.sample(
                             entity_candidates_id,
@@ -1942,6 +2499,7 @@ def main():
                     step_trace["stopped"] = "no_total_candidates"
                     trace_steps.append(step_trace)
                     break
+                _stage_t0 = time.time()
                 if args.selection_mode == "relation_first":
                     flag, chain_of_entities, entities_id, pre_relations, pre_heads = relation_first_select(
                         total_entities_id, total_relations, total_candidates,
@@ -1953,6 +2511,7 @@ def main():
                         total_entities_id, total_relations, total_candidates,
                         total_topic_entities, total_head, total_scores, args
                     )
+                _timer_add("final_selection", time.time() - _stage_t0)
                 step_trace["selected_relations"] = list(pre_relations)
                 step_trace["selected_entities"] = list(entities_id)
                 step_trace["selected_heads"] = list(pre_heads)
@@ -1976,12 +2535,14 @@ def main():
                 answer_vote_entities = []
                 answer_vote_success = False
                 if _env_enabled("DIPLAN_ANSWER_VOTING"):
+                    _stage_t0 = time.time()
                     answer_vote_entities = _score_voted_entities(
                         answer_vote_entities_id,
                         answer_vote_scores,
                         _env_int("DIPLAN_ANSWER_VOTE_K", int(args.relation_first_k or args.num_retain_entity)),
                     )
                     answer_vote_success = answer_reached(backend, answer_vote_entities)
+                    _timer_add("answer_voting", time.time() - _stage_t0)
                 success = bool(top1_success or answer_vote_success)
                 step_trace["answer_reached_top1"] = bool(top1_success)
                 step_trace["answer_voting_enabled"] = bool(_env_enabled("DIPLAN_ANSWER_VOTING"))
@@ -2013,15 +2574,42 @@ def main():
             if args.show_trace and task_idx <= args.trace_limit:
                 _print_trace(task_idx, trace_rec, args.trace_topk)
 
+    total_wall_time_s = time.time() - run_start_time
+    llm_stats = globals().get("_TOG_LLM_STATS", {"calls": 0, "errors": 0, "prompt_tokens": 0, "completion_tokens": 0, "wall_time_s": 0.0})
+    stage_timers = globals().get("_TOG_STAGE_TIMERS", {})
     summary = {
         "n": len(records),
         "hits@1": mean([1.0 if r["success"] else 0.0 for r in records]) if records else 0.0,
         "trap@1": mean([1.0 if r["trap_at_1"] else 0.0 for r in records]) if records else 0.0,
         "first_error_step": mean([r["first_error_step"] for r in records]) if records else 0.0,
+        "wall_time_s_total": total_wall_time_s,
+        "wall_time_s_per_task": total_wall_time_s / max(1, len(records)),
+        "wall_time_s_per_success": total_wall_time_s / max(1, sum(1 for r in records if r["success"])),
+        "llm_calls": int(llm_stats.get("calls", 0)),
+        "llm_errors": int(llm_stats.get("errors", 0)),
+        "llm_cache_hits": int(llm_stats.get("cache_hits", 0)),
+        "llm_prompt_tokens_est": int(llm_stats.get("prompt_tokens", 0)),
+        "llm_completion_tokens_est": int(llm_stats.get("completion_tokens", 0)),
+        "llm_total_tokens_est": int(llm_stats.get("prompt_tokens", 0)) + int(llm_stats.get("completion_tokens", 0)),
+        "llm_wall_time_s": float(llm_stats.get("wall_time_s", 0.0)),
+        "llm_calls_per_task": float(llm_stats.get("calls", 0)) / max(1, len(records)),
+        "stage_timers": stage_timers,
+        "stage_relation_prune_wall_time_s": float(stage_timers.get("relation_prune", {}).get("wall_time_s", 0.0)),
+        "stage_relation_prune_calls": int(stage_timers.get("relation_prune", {}).get("calls", 0)),
+        "stage_entity_prune_wall_time_s": float(stage_timers.get("entity_prune", {}).get("wall_time_s", 0.0)),
+        "stage_entity_prune_calls": int(stage_timers.get("entity_prune", {}).get("calls", 0)),
+        "stage_entity_search_wall_time_s": float(stage_timers.get("entity_search", {}).get("wall_time_s", 0.0)),
+        "stage_entity_search_calls": int(stage_timers.get("entity_search", {}).get("calls", 0)),
+        "stage_final_selection_wall_time_s": float(stage_timers.get("final_selection", {}).get("wall_time_s", 0.0)),
+        "stage_final_selection_calls": int(stage_timers.get("final_selection", {}).get("calls", 0)),
+        "stage_answer_voting_wall_time_s": float(stage_timers.get("answer_voting", {}).get("wall_time_s", 0.0)),
+        "stage_answer_voting_calls": int(stage_timers.get("answer_voting", {}).get("calls", 0)),
         "seed": args.seed,
         "planning_strategy": args.planning_strategy,
         "selection_mode": args.selection_mode,
         "relation_first_k": int(args.relation_first_k or args.num_retain_entity),
+        "relation_prune_tools": str(args.relation_prune_tools or args.prune_tools),
+        "entity_prune_tools": str(args.entity_prune_tools or args.prune_tools),
         "diplan_pool_strategy": getattr(args, "diplan_pool_strategy", "lexical"),
         "pog_guidance_weight": getattr(args, "pog_guidance_weight", 0.0),
         "pog_memory_weight": getattr(args, "pog_memory_weight", 0.0),
@@ -2053,6 +2641,10 @@ def main():
         summary.update(reranker.diagnostics())
     else:
         summary["diplan_rerank_calls"] = 0
+    if mcts_reranker:
+        summary.update(mcts_reranker.diagnostics())
+    else:
+        summary["mcts_enabled"] = False
     with (Path(args.out) / "summary_metrics.json").open("w", encoding="utf-8") as f:
         json.dump(summary, f, ensure_ascii=False, indent=2)
     print(json.dumps(summary, ensure_ascii=False, indent=2))

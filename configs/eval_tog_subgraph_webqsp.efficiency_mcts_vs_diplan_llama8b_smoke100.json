@@ -1,0 +1,46 @@
+{
+  "test_path": "data/rog_processed/webqsp_test.jsonl",
+  "include_datasets": ["webqsp"],
+  "max_tasks": 100,
+  "seed": 42,
+  "progress_every": 5,
+
+  "scorer": "llm",
+  "methods": ["flare", "diplan_diffusion"],
+
+  "k": 8,
+  "num_retain_entity": 5,
+
+  "flare": {
+    "S": 16,
+    "c": 1.4,
+    "k": 8,
+    "H": 3,
+    "mem_cap": 200,
+    "mem_sim": 0.9
+  },
+
+  "diffusion": {
+    "num_candidates": 16,
+    "diffusion_steps": 20,
+    "use_prefix": true,
+    "jitter_std": 0.05
+  },
+
+  "diplan_min_grounding_jaccard": 0.25,
+  "diplan_grounding_bonus": 1.0,
+  "diplan_candidate_rerank": true,
+  "diplan_value_weight": 1.0,
+  "diplan_value_max_query_len": 32,
+  "diplan_value_max_path_len": 30,
+
+  "llm_api_base": "http://127.0.0.1:8000/v1",
+  "llm_api_key": "EMPTY",
+  "llm_model": "Llama-3.1-8B-Instruct",
+  "llm_temperature": 0.1,
+  "llm_max_tokens": 128,
+  "llm_timeout_s": 60,
+  "llm_retries": 2,
+  "llm_max_relations_in_prompt": 128,
+  "llm_proposal_fusion": "rerank_hybrid"
+}

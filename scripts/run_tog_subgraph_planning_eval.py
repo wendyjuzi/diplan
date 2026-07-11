@@ -255,6 +255,23 @@ class FLAREToG:
         self.k = k
         self.H = H
         self.rng = rng
+        self.reset_stats()
+
+    def reset_stats(self) -> None:
+        self.simulations = 0
+        self.expanded_nodes = 0
+        self.rollout_steps = 0
+        self.candidate_expansions = 0
+        self.trajectory_evals = 0
+
+    def stats(self) -> Dict[str, float]:
+        return {
+            "mcts_simulations": float(self.simulations),
+            "mcts_expanded_nodes": float(self.expanded_nodes),
+            "mcts_rollout_steps": float(self.rollout_steps),
+            "candidate_expansions": float(self.candidate_expansions),
+            "trajectory_evals": float(self.trajectory_evals),
+        }
 
     def _ucb(self, node: MCTSNode, idx: int) -> float:
         if node.Na.get(idx, 0) == 0:
@@ -272,6 +289,7 @@ class FLAREToG:
         return root.untried[best_idx]
 
     def _simulate(self, env: ToGSubgraphEnv, root: MCTSNode, ctx) -> None:
+        self.simulations += 1
         node = root
         path: List[Tuple[MCTSNode, int, ToGCandidate]] = []
         traj: List[str] = []
@@ -280,6 +298,7 @@ class FLAREToG:
         while not env.is_terminal(node.state) and node.depth_from_root < self.H:
             if node.untried is None:
                 node.untried = env.candidate_actions(node.state, ctx["scorer"], self.k)
+                self.candidate_expansions += len(node.untried)
                 for i in range(len(node.untried)):
                     node.Q.setdefault(i, 0.0)
                     node.Na.setdefault(i, 0)
@@ -291,6 +310,7 @@ class FLAREToG:
                 cand = node.untried[idx]
                 child = MCTSNode(cand.next_state, depth_from_root=node.depth_from_root + 1)
                 node.children[idx] = child
+                self.expanded_nodes += 1
                 path.append((node, idx, cand))
                 traj.append(cand.relation)
                 entity_trace.append([h.entity for h in cand.next_state.hyps])
@@ -306,14 +326,17 @@ class FLAREToG:
         st = node.state
         while len(traj) < self.H and not env.is_terminal(st):
             cands = env.candidate_actions(st, ctx["scorer"], self.k)
+            self.candidate_expansions += len(cands)
             if not cands:
                 break
             cand = self.rng.choice(cands[: max(1, min(self.k, len(cands)))])
             traj.append(cand.relation)
             st = cand.next_state
             entity_trace.append([h.entity for h in st.hyps])
+            self.rollout_steps += 1
 
         ret = ctx["scorer"].score_trajectory(env.question, traj, entity_trace)
+        self.trajectory_evals += 1
         for n, idx, _ in path:
             n.N += 1
             n.Na[idx] += 1
@@ -329,6 +352,34 @@ class DiPLaNToG:
         self.fuzzy_hits = 0
         self.fallbacks = 0
         self.candidate_rerank_calls = 0
+        self.diffusion_calls = 0
+        self.diffusion_samples = 0
+        self.candidate_expansions = 0
+        self.value_rerank_items = 0
+
+    def reset_stats(self) -> None:
+        self.grounded_hits = 0
+        self.grounded_misses = 0
+        self.fuzzy_hits = 0
+        self.fallbacks = 0
+        self.candidate_rerank_calls = 0
+        self.diffusion_calls = 0
+        self.diffusion_samples = 0
+        self.candidate_expansions = 0
+        self.value_rerank_items = 0
+
+    def stats(self) -> Dict[str, float]:
+        tot = self.grounded_hits + self.grounded_misses
+        return {
+            "diffusion_calls": float(self.diffusion_calls),
+            "diffusion_samples": float(self.diffusion_samples),
+            "candidate_expansions": float(self.candidate_expansions),
+            "diplan_candidate_rerank_calls": float(self.candidate_rerank_calls),
+            "value_rerank_items": float(self.value_rerank_items),
+            "diffusion_grounding_hit_rate": self.grounded_hits / max(1, tot),
+            "diffusion_fuzzy_grounding_rate": self.fuzzy_hits / max(1, tot),
+            "diffusion_grounding_fallback_rate": self.fallbacks / max(1, tot),
+        }
 
     @staticmethod
     def _relation_jaccard(a: str, b: str) -> float:
@@ -366,6 +417,7 @@ class DiPLaNToG:
         from src.diplan.inference import sample_plan_candidates
 
         cands = env.candidate_actions(state, ctx["scorer"], self.fallback.k)
+        self.candidate_expansions += len(cands)
         if not cands:
             return None
         admissible = {c.relation for c in cands}
@@ -388,6 +440,8 @@ class DiPLaNToG:
             planner_type=b.planner_type,
             jitter_std=b.jitter_std,
         )
+        self.diffusion_calls += 1
+        self.diffusion_samples += len(sampled)
         firsts = [p[0] for p in sampled if p]
         min_jaccard = float(ctx.get("diplan_min_grounding_jaccard", 0.25))
         bonus_weight = float(ctx.get("diplan_grounding_bonus", 1.0))
@@ -403,6 +457,7 @@ class DiPLaNToG:
 
         if bool(ctx.get("diplan_candidate_rerank", False)):
             self.candidate_rerank_calls += 1
+            self.value_rerank_items += len(cands)
             value_weight = float(ctx.get("diplan_value_weight", 1.0))
             candidate_paths = [list(ctx["executed"]) + [c.relation] for c in cands]
             value_scores = score_candidates_with_value(
@@ -438,6 +493,18 @@ def _z_norm(xs: Sequence[float]) -> List[float]:
     if std < 1e-8:
         return [0.0 for _ in vals]
     return [(x - mu) / std for x in vals]
+
+
+def _planner_stats(planner) -> Dict[str, float]:
+    fn = getattr(planner, "stats", None)
+    if callable(fn):
+        return {str(k): float(v) for k, v in fn().items()}
+    return {}
+
+
+def _stats_delta(before: Dict[str, float], after: Dict[str, float]) -> Dict[str, float]:
+    keys = sorted(set(before) | set(after))
+    return {k: float(after.get(k, 0.0)) - float(before.get(k, 0.0)) for k in keys}
 
 
 def make_planner(name: str, cfg: dict, rng: random.Random, bundle=None):
@@ -521,7 +588,7 @@ def aggregate(records: List[dict]) -> dict:
     if not records:
         return {}
     trap_rows = [r for r in records if r["has_trap"]]
-    return {
+    out = {
         "n": len(records),
         "hits@1": round(mean(1.0 if r["success"] else 0.0 for r in records), 4),
         "trap@1": round(mean(1.0 if r["trap_at_1"] else 0.0 for r in trap_rows), 4) if trap_rows else None,
@@ -529,6 +596,27 @@ def aggregate(records: List[dict]) -> dict:
         "recovery@first_error": round(mean(1.0 if r["recovery_at_error"] else 0.0 for r in records), 4),
         "avg_steps": round(mean(r["steps"] for r in records), 3),
     }
+    efficiency_keys = [
+        "wall_time_s",
+        "candidate_expansions",
+        "trajectory_evals",
+        "mcts_simulations",
+        "mcts_expanded_nodes",
+        "mcts_rollout_steps",
+        "diffusion_calls",
+        "diffusion_samples",
+        "diplan_candidate_rerank_calls",
+        "value_rerank_items",
+    ]
+    for key in efficiency_keys:
+        vals = [float(r.get(key, 0.0)) for r in records]
+        out[f"{key}_mean"] = round(mean(vals), 6)
+        out[f"{key}_total"] = round(sum(vals), 6)
+    out["wall_time_per_success"] = round(
+        sum(float(r.get("wall_time_s", 0.0)) for r in records) / max(1, sum(1 for r in records if r["success"])),
+        6,
+    )
+    return out
 
 
 def main() -> None:
@@ -583,8 +671,11 @@ def main() -> None:
         has_trap = bool(trap and oracle and trap[0] != oracle[0])
         for m in methods:
             mt0 = time.time()
+            stat_before = _planner_stats(planners[m])
             env = ToGSubgraphEnv(row, num_retain_entity=int(cfg.get("num_retain_entity", 5)))
             out = run_episode(env, planners[m], scorer, rng, cfg)
+            wall_time_s = time.time() - mt0
+            stat_delta = _stats_delta(stat_before, _planner_stats(planners[m]))
             pred = out["executed_path"]
             rec = {
                 "task_id": row.get("task_id"),
@@ -596,11 +687,13 @@ def main() -> None:
                 "trap_at_1": trap_at_1(pred, trap),
                 "has_trap": has_trap,
                 "steps": len(pred),
+                "wall_time_s": wall_time_s,
                 "executed_path": pred,
                 "oracle_path": oracle,
                 "entity_trace": out["entity_trace"],
                 "final_entities": out["final_entities"],
             }
+            rec.update(stat_delta)
             by_method[m].append(rec)
             predictions.append(rec)
             if progress_every and (i == 1 or i % progress_every == 0):
@@ -614,7 +707,10 @@ def main() -> None:
                             "success": rec["success"],
                             "trap": rec["trap_at_1"],
                             "steps": rec["steps"],
-                            "elapsed_s": round(time.time() - mt0, 2),
+                            "elapsed_s": round(wall_time_s, 2),
+                            "candidate_expansions": round(float(rec.get("candidate_expansions", 0.0)), 2),
+                            "trajectory_evals": round(float(rec.get("trajectory_evals", 0.0)), 2),
+                            "diffusion_samples": round(float(rec.get("diffusion_samples", 0.0)), 2),
                             "llm_calls": getattr(client, "calls", None),
                             "llm_errors": getattr(client, "errors", None),
                             "fallbacks": getattr(scorer, "fallbacks", None),

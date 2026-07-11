@@ -69,12 +69,32 @@ def pad_2d(seqs: List[List[int]], pad_id: int) -> Tuple[torch.Tensor, torch.Tens
 
 
 class AutoencoderDataset(Dataset):
-    def __init__(self, rows: List[Dict], path_vocab: SimpleVocab, max_path_len: int) -> None:
+    def __init__(
+        self,
+        rows: List[Dict],
+        path_vocab: SimpleVocab,
+        max_path_len: int,
+        include_suffixes: bool = False,
+    ) -> None:
+        # When prefix_conditioning is used downstream (WeightedDiffusionDataset
+        # targets cand[k:], the continuation, not the full plan), the AE must
+        # also be trained to encode/decode arbitrary suffixes of oracle paths --
+        # otherwise its latent space and greedy decoder are only ever fit to the
+        # full-path length/start-token distribution and extrapolate to garbage
+        # when asked to decode continuation-only latents at inference time.
         self.samples = []
         for row in rows:
-            ids = path_vocab.encode(row["oracle_path"], add_bos_eos=True, max_len=max_path_len)
+            oracle = list(row.get("oracle_path", []))
+            if not oracle:
+                continue
+            ids = path_vocab.encode(oracle, add_bos_eos=True, max_len=max_path_len)
             if len(ids) >= 3:
                 self.samples.append(ids)
+            if include_suffixes:
+                for k in range(1, len(oracle)):
+                    suffix_ids = path_vocab.encode(oracle[k:], add_bos_eos=True, max_len=max_path_len)
+                    if len(suffix_ids) >= 3:
+                        self.samples.append(suffix_ids)
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -121,7 +141,12 @@ class WeightedDiffusionDataset(Dataset):
     When ``prefix_conditioning`` is enabled (paper §5.1/§5.5) the condition stream
     becomes ``query_tokens [SEP] plan[:k]`` for a randomly sampled cut ``k`` (with a
     high probability of ``k=0``), so the planner learns state-aware re-planning. The
-    diffusion target stays the full plan latent.
+    diffusion target is the *continuation* ``plan[k:]`` (re-encoded with its own
+    BOS/EOS), not the full plan: regressing to the full plan regardless of ``k``
+    gives the model no training signal to actually use the executed-prefix
+    conditioning, since the target is identical whether ``k=0`` or ``k>0``. This
+    was empirically confirmed to collapse to unconditional high-frequency-path
+    memorization (near-zero prefix-reproduction rate on unseen prefixes).
     """
 
     def __init__(
@@ -215,9 +240,6 @@ class WeightedDiffusionDataset(Dataset):
                 # This keeps diffusion focused on actionable futures instead of
                 # cloning high-LCP but non-completing near misses.
                 w = max(1e-4, exec_score) * math.exp(float(alpha) * r_norm)
-                path_ids = path_vocab.encode(cand, add_bos_eos=True, max_len=max_path_len)
-                if len(path_ids) < 3:
-                    continue
 
                 if prefix_conditioning and sep_id is not None:
                     # Sample a commit-prefix cut over this plan; bias toward k=0.
@@ -230,8 +252,16 @@ class WeightedDiffusionDataset(Dataset):
                     else:
                         cond_base = query_tokens
                     cond_tokens = cond_base + ([SEP] + cand[:k] if k > 0 else [])
+                    # Target is the continuation only: at k=0 this is `cand` itself
+                    # (unchanged behaviour); at k>0 it must NOT include the already-
+                    # given prefix again, or the model has no signal to condition on it.
+                    target_cand = cand[k:]
                 else:
                     cond_tokens = list(state_prefixes[0]) if state_prefixes else query_tokens
+                    target_cand = cand
+                path_ids = path_vocab.encode(target_cand, add_bos_eos=True, max_len=max_path_len)
+                if len(path_ids) < 3:
+                    continue
                 query_ids = query_vocab.encode(cond_tokens, add_bos_eos=False, max_len=max_query_len)
                 if not query_ids:
                     continue

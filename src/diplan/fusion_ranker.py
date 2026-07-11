@@ -1,3 +1,4 @@
+
 """Learned fusion head for parallel KGQA planning signals."""
 
 from __future__ import annotations

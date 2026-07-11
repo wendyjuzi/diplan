@@ -32,15 +32,22 @@ def main() -> None:
     # When prefix conditioning is enabled (paper §5.1/§5.5) the query/condition vocab
     # is unioned with plan tokens + <sep> so an executed prefix can be packed into the
     # planner condition. AE, planner and value models all share this vocab.
+    prefix_conditioning = bool(cfg.get("prefix_conditioning", False))
     path_vocab, query_vocab = build_vocabs(
         rows,
         min_freq=int(cfg.get("min_freq", 1)),
-        prefix_conditioning=bool(cfg.get("prefix_conditioning", False)),
+        prefix_conditioning=prefix_conditioning,
     )
     dataset = AutoencoderDataset(
         rows=rows,
         path_vocab=path_vocab,
         max_path_len=int(cfg.get("max_path_len", 8)),
+        # Downstream (WeightedDiffusionDataset) trains the planner to target
+        # cand[k:] continuations, not full plans, when prefix_conditioning is on.
+        # The AE must see the same suffix distribution during its own training,
+        # or its latent space / greedy decoder only ever learn full-length paths
+        # and extrapolate to garbage when asked to decode a continuation.
+        include_suffixes=prefix_conditioning,
     )
     pad_id = path_vocab.stoi[PAD]
     loader = DataLoader(
